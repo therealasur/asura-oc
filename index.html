@@ -13,6 +13,8 @@
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="apple-mobile-web-app-title" content="ASURA OC">
 <link rel="apple-touch-icon" href="/asura-oc/icons/icon-192.png">
+<link rel="icon" type="image/png" sizes="192x192" href="/asura-oc/icons/icon-192.png">
+<link rel="shortcut icon" href="/asura-oc/icons/icon-192.png">
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap');
 *{box-sizing:border-box;margin:0;padding:0;}
@@ -527,7 +529,7 @@ console.log('OC Firebase Auth ready');
     </div>
     <input type="email" class="lock-input" id="oc_lock_email" placeholder="Your email" autocomplete="email" style="margin-bottom:10px;letter-spacing:0;" onkeydown="if(event.key==='Enter')document.getElementById('oc_lock_pass').focus()"/>
     <input type="password" class="lock-input" id="oc_lock_pass" placeholder="Password" autocomplete="current-password" onkeydown="if(event.key==='Enter')ocTryUnlock()"/>
-    <button class="lock-btn" onclick="ocTryUnlock()" id="oc_lock_btn">🔓 Sign In</button>
+    <button class="lock-btn" onclick="ocTryUnlock()" id="oc_lock_btn">Sign In</button>
     <div class="lock-err" id="oc_lock_err"></div>
   </div>
 </div>
@@ -550,7 +552,11 @@ console.log('OC Firebase Auth ready');
       <div class="spinner" id="spinner"></div>
       <button class="icon-btn" onclick="fetchAll()" title="Refresh">&#8635;</button>
       <button class="icon-btn" id="theme_btn" onclick="toggleTheme()" title="Toggle theme">🌙</button>
-      <button class="icon-btn" onclick="ocDoSignOut()" title="Sign out" style="font-size:13px;">⏻</button>
+      <button class="icon-btn" onclick="ocDoSignOut()" title="Sign out" onmouseover="this.style.background='rgba(240,69,69,0.1)';this.style.borderColor='rgba(240,69,69,0.3)';this.querySelector('svg').style.stroke='#f04545';" onmouseout="this.style.background='';this.style.borderColor='';this.querySelector('svg').style.stroke='';">
+        <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" style="transition:stroke 0.15s;">
+          <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/>
+        </svg>
+      </button>
     </div>
   </div>
 </header>
@@ -1125,7 +1131,7 @@ function ocTryUnlock() {
     if(window._ocSignIn) {
       window._ocSignIn(email, pass).then(function(res) {
         btn.disabled = false;
-        btn.textContent = '🔓 Sign In';
+        btn.textContent = 'Sign In';
         if(!res.ok) {
           err.textContent = res.msg || 'Sign-in failed. Check credentials.';
           document.getElementById('oc_lock_pass').value = '';
@@ -5457,40 +5463,4 @@ window.onload=function(){
 };
 </script>
 </body>
-</html>/* ═══════════════════════════════════════════════
-   FIREBASE AUTH LOCK
-═══════════════════════════════════════════════ */
-function ocTryUnlock() {
-  var email = (document.getElementById('oc_lock_email').value||'').trim();
-  var pass  = (document.getElementById('oc_lock_pass').value||'').trim();
-  var err   = document.getElementById('oc_lock_err');
-  var btn   = document.getElementById('oc_lock_btn');
-  if(!email || !pass) { err.textContent = 'Enter your email and password.'; return; }
-  btn.disabled = true; btn.textContent = 'Signing in…'; err.textContent = '';
-  function trySignIn() {
-    if(window._ocSignIn) {
-      window._ocSignIn(email, pass).then(function(res) {
-        btn.disabled = false; btn.textContent = '🔓 Sign In';
-        if(!res.ok) {
-          err.textContent = res.msg || 'Sign-in failed.';
-          document.getElementById('oc_lock_pass').value = '';
-        }
-        /* Success: Firebase onAuthStateChanged shows the app automatically */
-      });
-    } else { setTimeout(trySignIn, 300); }
-  }
-  trySignIn();
-}
-
-/* ocCheckLock: Firebase handles session persistence automatically.
-   Just focus the email input if not yet signed in. */
-function ocCheckLock() {
-  setTimeout(function(){
-    var ls = document.getElementById('oc_lock_screen');
-    if(ls && !ls.classList.contains('hidden')) {
-      var el = document.getElementById('oc_lock_email');
-      if(el) el.focus();
-    }
-  }, 500);
-}
-
+</html>
