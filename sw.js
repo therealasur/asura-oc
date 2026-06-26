@@ -1,5 +1,5 @@
-/* ASURA OC Dashboard — Service Worker v2 */
-const CACHE = 'asura-oc-v2';
+/* ASURA OC Dashboard — Service Worker v3 */
+const CACHE = 'asura-oc-v3';
 const ASSETS = [
   '/asura-oc/',
   '/asura-oc/index.html',
@@ -24,7 +24,6 @@ self.addEventListener('activate', e => {
 
 self.addEventListener('fetch', e => {
   const url = e.request.url;
-  // Never intercept Firebase Auth, Firestore, Dhan proxy, or Google Fonts
   if (url.includes('firestore.googleapis') ||
       url.includes('firebase') ||
       url.includes('googleapis.com') ||
@@ -37,7 +36,6 @@ self.addEventListener('fetch', e => {
       url.includes('fonts.googleapis')) {
     return;
   }
-  // Network-first for HTML so updates always reach you
   if (url.endsWith('.html') || url.endsWith('/') || (url.includes('/asura-oc/') && !url.includes('.'))) {
     e.respondWith(
       fetch(e.request)
