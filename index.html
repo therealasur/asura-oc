@@ -433,7 +433,7 @@ body.light .picker-input{color-scheme:light;}
 <!-- ══ FIREBASE ══ -->
 <script type="module">
 import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
-import { getFirestore, collection, getDocs, query, orderBy, limit, doc, setDoc, deleteDoc } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
+import { getFirestore, collection, getDocs, query, orderBy, doc, setDoc, deleteDoc } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
 import { getAuth, signInWithEmailAndPassword, signOut, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
 
 const firebaseConfig = {
@@ -495,7 +495,7 @@ window._ocSaveSnapshot = async function(snap) {
 window._ocLoadSnapshots = async function() {
   if (!window._ocCurrentUser) return [];
   try {
-    var q = query(collection(db, 'oc_sessions'), orderBy('ts', 'desc'), limit(2000));
+    var q = query(collection(db, 'oc_sessions'), orderBy('ts', 'desc'));
     var snap = await getDocs(q);
     var rows = [];
     snap.forEach(function(d){ rows.push(d.data()); });
