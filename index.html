@@ -419,11 +419,35 @@ body.light .picker-input{color-scheme:light;}
 
 /* ── MOBILE HAMBURGER ── */
 .mob-menu-btn{display:none;width:36px;height:36px;align-items:center;justify-content:center;background:var(--bg3);border:1px solid var(--border2);border-radius:var(--radius-sm);cursor:pointer;font-size:16px;color:var(--text);flex-shrink:0;}
+
+/* ── PWA INSTALL BANNER ── */
+#pwa-install-banner{display:none;position:fixed;bottom:16px;left:50%;transform:translateX(-50%);z-index:9999;background:var(--bg2);border:1px solid var(--teal-border);border-radius:14px;padding:12px 18px;box-shadow:0 8px 32px rgba(0,0,0,0.45);align-items:center;gap:12px;max-width:calc(100vw - 32px);width:360px;}
+#pwa-install-banner.show{display:flex;}
+#pwa-install-banner .pwa-icon{font-size:24px;flex-shrink:0;}
+#pwa-install-banner .pwa-text{flex:1;min-width:0;}
+#pwa-install-banner .pwa-title{font-size:13px;font-weight:700;color:var(--text);}
+#pwa-install-banner .pwa-sub{font-size:11px;color:var(--text2);margin-top:1px;}
+#pwa-install-banner .pwa-btn{padding:7px 14px;border-radius:8px;background:linear-gradient(135deg,var(--teal),var(--blue));border:none;color:#fff;font-size:12px;font-weight:700;cursor:pointer;font-family:inherit;white-space:nowrap;flex-shrink:0;}
+#pwa-install-banner .pwa-close{width:24px;height:24px;display:flex;align-items:center;justify-content:center;border-radius:50%;border:none;background:var(--bg4);color:var(--text2);cursor:pointer;font-size:14px;flex-shrink:0;line-height:1;}
+
+/* ── PWA INSTALL header button (shown when banner dismissed but prompt available) ── */
+#pwa-header-btn{display:none;padding:4px 10px;border-radius:20px;font-size:11px;font-weight:600;border:1px solid var(--teal-border);background:var(--teal-bg);color:var(--teal);cursor:pointer;white-space:nowrap;}
+#pwa-header-btn.show{display:inline-flex;align-items:center;gap:4px;}
+
+/* ── MOBILE HEADER DROPDOWN ── */
+#mob-header-dropdown{display:none;position:fixed;top:64px;left:0;right:0;z-index:200;background:var(--bg2);border-bottom:1px solid var(--border2);padding:10px 14px;flex-direction:column;gap:8px;box-shadow:0 8px 24px rgba(0,0,0,0.3);}
+#mob-header-dropdown.open{display:flex;}
+#mob-header-dropdown .mob-chip-row{display:flex;gap:8px;flex-wrap:wrap;}
+#mob-header-dropdown .mob-actions{display:flex;gap:8px;align-items:center;padding-top:6px;border-top:1px solid var(--border);}
+
 @media(max-width:700px){
   .mob-menu-btn{display:flex;}
-  .header-right{overflow-x:auto;-webkit-overflow-scrolling:touch;flex-wrap:nowrap;max-width:calc(100vw - 100px);scrollbar-width:none;}
-  .header-right::-webkit-scrollbar{display:none;}
+  /* Hide full header-right on mobile — use dropdown instead */
+  .header-right{display:none !important;}
   .header{padding:0 12px;}
+  .header-inner{gap:8px;}
+  .brand-h1{font-size:16px;}
+  .brand-sub{font-size:9px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:calc(100vw - 120px);}
   .page{padding:12px 12px 50px;}
 }
 </style>
@@ -1222,10 +1246,42 @@ function ocSaveToFirebase(snap) {
 
 /* ── Mobile hamburger for header ── */
 function toggleMobileHeaderMenu() {
-  var hr = document.querySelector('.header-right');
-  if(!hr) return;
-  hr.style.display = hr.style.display === 'none' ? 'flex' : 'none';
+  var dd = document.getElementById('mob-header-dropdown');
+  if(!dd) return;
+  dd.classList.toggle('open');
+  // Sync chips from header-right into dropdown each time it opens
+  if(dd.classList.contains('open')) {
+    syncMobChips();
+  }
 }
+function syncMobChips() {
+  var cr = document.getElementById('mob-chips-row');
+  if(!cr) return;
+  // Gather live values from header chips
+  var liveTxt = document.getElementById('live_txt') ? document.getElementById('live_txt').textContent : '—';
+  var liveDot = document.getElementById('live_badge') ? document.getElementById('live_badge').className : '';
+  var spotVal = document.getElementById('spot_val') ? document.getElementById('spot_val').textContent : '—';
+  var vixVal = document.getElementById('vix_val') ? document.getElementById('vix_val').textContent : '—';
+  var invertBadge = document.getElementById('invert_active_badge');
+  var invertVisible = invertBadge && invertBadge.classList.contains('visible');
+  var updTxt = document.getElementById('updated_txt') ? document.getElementById('updated_txt').textContent : '';
+  cr.innerHTML =
+    '<div class="hchip hchip-gray"><span class="dot" style="background:var(--teal)"></span>' + liveTxt + '</div>' +
+    '<div class="hchip" style="font-family:\'JetBrains Mono\',monospace;">SPOT <span style="margin-left:4px;">' + spotVal + '</span></div>' +
+    '<div class="hchip">VIX <span style="margin-left:4px;">' + vixVal + '</span></div>' +
+    (invertVisible ? '<div class="invert-badge visible">🔄 INVERTED</div>' : '');
+  // also mirror updated time
+  var utm = document.getElementById('updated_txt_mob');
+  if(utm && updTxt) utm.textContent = updTxt;
+}
+// Close dropdown when clicking outside
+document.addEventListener('click', function(e) {
+  var dd = document.getElementById('mob-header-dropdown');
+  var btn = document.getElementById('mob_header_btn');
+  if(dd && dd.classList.contains('open') && !dd.contains(e.target) && e.target !== btn && !btn.contains(e.target)) {
+    dd.classList.remove('open');
+  }
+});
 
 
 function toggleInvertBias(){
@@ -5455,6 +5511,45 @@ function ocDoSignOut() {
   }
 }
 
+/* ── PWA Install Prompt ── */
+var _pwaPrompt = null;
+window.addEventListener('beforeinstallprompt', function(e) {
+  e.preventDefault();
+  _pwaPrompt = e;
+  // Show banner after short delay
+  setTimeout(showPwaBanner, 1500);
+});
+window.addEventListener('appinstalled', function() {
+  hidePwaBanner();
+  _pwaPrompt = null;
+  var hb = document.getElementById('pwa-header-btn');
+  if(hb) hb.classList.remove('show');
+});
+function showPwaBanner() {
+  if(!_pwaPrompt) return;
+  var b = document.getElementById('pwa-install-banner');
+  if(b) b.classList.add('show');
+  var hb = document.getElementById('pwa-header-btn');
+  if(hb) hb.classList.add('show');
+  // Also add to mobile dropdown
+  var mhb = document.getElementById('mob-install-btn');
+  if(mhb) mhb.style.display = 'inline-flex';
+}
+function hidePwaBanner() {
+  var b = document.getElementById('pwa-install-banner');
+  if(b) b.classList.remove('show');
+}
+function triggerPwaInstall() {
+  if(!_pwaPrompt) return;
+  _pwaPrompt.prompt();
+  _pwaPrompt.userChoice.then(function(c){
+    if(c.outcome === 'accepted') {
+      _pwaPrompt = null;
+      hidePwaBanner();
+    }
+  });
+}
+
 window.onload=function(){
   if ('serviceWorker' in navigator) {
     navigator.serviceWorker.register('/asura-oc/sw.js').catch(function(){});
@@ -5462,5 +5557,36 @@ window.onload=function(){
   ocCheckLock();
 };
 </script>
+<!-- ══ PWA INSTALL BANNER ══ -->
+<div id="pwa-install-banner">
+  <span class="pwa-icon">📊</span>
+  <div class="pwa-text">
+    <div class="pwa-title">Install ASURA OC</div>
+    <div class="pwa-sub">Add to home screen for quick access</div>
+  </div>
+  <button class="pwa-btn" onclick="triggerPwaInstall()">Install</button>
+  <button class="pwa-close" onclick="hidePwaBanner()" title="Dismiss">✕</button>
+</div>
+
+<!-- ══ MOBILE HEADER DROPDOWN ══ -->
+<div id="mob-header-dropdown">
+  <div class="mob-chip-row" id="mob-chips-row">
+    <!-- chips cloned by JS -->
+  </div>
+  <div class="mob-actions">
+    <button class="icon-btn" onclick="fetchAll()" title="Refresh" style="flex-shrink:0;">&#8635;</button>
+    <button class="icon-btn" id="theme_btn_mob" onclick="toggleTheme()" title="Toggle theme" style="flex-shrink:0;">🌙</button>
+    <button class="icon-btn" onclick="ocDoSignOut()" style="flex-shrink:0;" title="Sign out"
+      onmouseover="this.style.background='rgba(240,69,69,0.1)'"
+      onmouseout="this.style.background=''">
+      <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/>
+      </svg>
+    </button>
+    <button id="mob-install-btn" class="pwa-btn" onclick="triggerPwaInstall()" style="display:none;font-size:11px;padding:5px 10px;">⬇ Install App</button>
+    <span class="updated-txt" id="updated_txt_mob" style="font-size:10px;color:var(--text3);margin-left:auto;"></span>
+  </div>
+</div>
+
 </body>
 </html>
