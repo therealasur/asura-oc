@@ -464,7 +464,7 @@ body.light .picker-input{color-scheme:light;}
 <script type="module">
 import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
 import { getFirestore, collection, getDocs, query, orderBy, doc, setDoc, deleteDoc } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
-import { getAuth, signInWithEmailAndPassword, signOut, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
+import { getAuth, signInWithEmailAndPassword, signOut, onAuthStateChanged, sendSignInLinkToEmail, isSignInWithEmailLink, signInWithEmailLink } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
 
 const firebaseConfig = {
   apiKey: "AIzaSyDDu28DwdZvkW36GeiYCu62msVzVxIl7uE",
@@ -495,6 +495,12 @@ onAuthStateChanged(auth, (user) => {
     var txt = document.getElementById('oc_fb_status');
     if(dot) dot.className = 'firebase-status-dot ok';
     if(txt) txt.textContent = 'Ready — sign in';
+    var s1 = document.getElementById('oc_lock_step1');
+    var s2 = document.getElementById('oc_lock_step2');
+    if(s1) s1.style.display = 'block';
+    if(s2) s2.style.display = 'none';
+    var emailEl2 = document.getElementById('oc_lock_email');
+    if(emailEl2) setTimeout(function(){ emailEl2.focus(); }, 200);
   }
 });
 
@@ -512,6 +518,39 @@ window._ocSignIn = async function(email, password) {
 };
 
 window._ocSignOut = async function() { await signOut(auth); };
+
+const OC_ACTION_CODE_SETTINGS = {
+  url: 'https://therealasur.github.io/asura-oc/',
+  handleCodeInApp: true
+};
+
+window._ocSendOtpLink = function(email) {
+  return sendSignInLinkToEmail(auth, email, OC_ACTION_CODE_SETTINGS)
+    .then(() => {
+      window.localStorage.setItem('asura_oc_otp_email', email);
+      return { ok: true };
+    })
+    .catch(e => ({ ok: false, msg: e.message || 'Failed to send link.' }));
+};
+
+// ── Handle magic link redirect on page load ──
+(async function() {
+  if (isSignInWithEmailLink(auth, window.location.href)) {
+    var email = window.localStorage.getItem('asura_oc_otp_email');
+    if (!email) {
+      email = window.prompt('Please enter your email to complete sign-in:');
+    }
+    if (email) {
+      try {
+        await signInWithEmailLink(auth, email, window.location.href);
+        window.localStorage.removeItem('asura_oc_otp_email');
+        window.history.replaceState({}, document.title, window.location.pathname);
+      } catch(e) {
+        console.warn('OC email link sign-in failed:', e);
+      }
+    }
+  }
+})();
 
 window._ocSaveSnapshot = async function(snap) {
   if (!window._ocCurrentUser) return false;
@@ -557,10 +596,34 @@ console.log('OC Firebase Auth ready');
       <span class="firebase-status-dot" id="oc_fb_dot"></span>
       <span style="font-size:11px;color:#5c5c6e;" id="oc_fb_status">Connecting…</span>
     </div>
-    <input type="email" class="lock-input" id="oc_lock_email" placeholder="Your email" autocomplete="email" style="margin-bottom:10px;letter-spacing:0;" onkeydown="if(event.key==='Enter')document.getElementById('oc_lock_pass').focus()"/>
-    <input type="password" class="lock-input" id="oc_lock_pass" placeholder="Password" autocomplete="current-password" onkeydown="if(event.key==='Enter')ocTryUnlock()"/>
-    <button class="lock-btn" onclick="ocTryUnlock()" id="oc_lock_btn">Sign In</button>
-    <div class="lock-err" id="oc_lock_err"></div>
+    <!-- Step 1: Email entry -->
+    <div id="oc_lock_step1">
+      <input type="email" class="lock-input" id="oc_lock_email" placeholder="Your email" autocomplete="email" style="margin-bottom:12px;letter-spacing:0;" onkeydown="if(event.key==='Enter')ocLockNextStep()"/>
+      <button class="lock-btn" id="oc_lock_next_btn" onclick="ocLockNextStep()">Continue →</button>
+      <div class="lock-err" id="oc_lock_err_step1"></div>
+    </div>
+
+    <!-- Step 2: Choose method -->
+    <div id="oc_lock_step2" style="display:none;">
+      <div style="font-size:12px;color:#9898a8;margin-bottom:14px;word-break:break-all;" id="oc_lock_email_display"></div>
+      <!-- Password sign-in -->
+      <input type="password" class="lock-input" id="oc_lock_pass" placeholder="Password" autocomplete="current-password" onkeydown="if(event.key==='Enter')ocTryUnlock()" style="margin-bottom:10px;"/>
+      <button class="lock-btn" id="oc_lock_btn" onclick="ocTryUnlock()" style="margin-bottom:10px;">Sign In</button>
+      <!-- Divider -->
+      <div style="display:flex;align-items:center;gap:10px;margin:4px 0 10px;">
+        <div style="flex:1;height:1px;background:rgba(255,255,255,0.07);"></div>
+        <span style="font-size:10px;color:#4a4a5e;text-transform:uppercase;letter-spacing:0.6px;">or</span>
+        <div style="flex:1;height:1px;background:rgba(255,255,255,0.07);"></div>
+      </div>
+      <!-- Email link -->
+      <button class="lock-btn" id="oc_lock_otp_btn" onclick="ocSendOtpLink()" style="background:transparent;border:1px solid rgba(0,201,160,0.3);color:#00c9a0;margin-bottom:6px;">📧 Send Sign-In Link</button>
+      <div id="oc_lock_otp_sent" style="display:none;font-size:11px;color:#00c9a0;margin-top:6px;line-height:1.5;">
+        ✓ Link sent! Check your email and tap the link to sign in.<br>
+        <span style="color:#4a4a5e;font-size:10px;">You can close this tab after tapping the link.</span>
+      </div>
+      <button onclick="ocLockBack()" style="background:none;border:none;color:#4a4a5e;font-size:11px;cursor:pointer;margin-top:10px;font-family:inherit;">← Use different email</button>
+      <div class="lock-err" id="oc_lock_err"></div>
+    </div>
   </div>
 </div>
 
@@ -1148,12 +1211,30 @@ window.addEventListener('error', function(ev){
 /* ═══════════════════════════════════════════════════════
    FIREBASE AUTH LOCK
 ═══════════════════════════════════════════════════════ */
+function ocLockNextStep() {
+  var email = (document.getElementById('oc_lock_email').value || '').trim();
+  var err = document.getElementById('oc_lock_err_step1');
+  if (!email || !email.includes('@')) { err.textContent = 'Enter a valid email.'; return; }
+  err.textContent = '';
+  document.getElementById('oc_lock_email_display').textContent = email;
+  document.getElementById('oc_lock_step1').style.display = 'none';
+  document.getElementById('oc_lock_step2').style.display = 'block';
+  setTimeout(function(){ document.getElementById('oc_lock_pass').focus(); }, 100);
+}
+function ocLockBack() {
+  document.getElementById('oc_lock_step2').style.display = 'none';
+  document.getElementById('oc_lock_step1').style.display = 'block';
+  document.getElementById('oc_lock_err').textContent = '';
+  document.getElementById('oc_lock_otp_sent').style.display = 'none';
+  document.getElementById('oc_lock_otp_btn').style.display = '';
+  setTimeout(function(){ document.getElementById('oc_lock_email').focus(); }, 100);
+}
 function ocTryUnlock() {
   var email = (document.getElementById('oc_lock_email').value||'').trim();
   var pass  = (document.getElementById('oc_lock_pass').value||'').trim();
   var err   = document.getElementById('oc_lock_err');
   var btn   = document.getElementById('oc_lock_btn');
-  if(!email || !pass) { err.textContent = 'Enter your email and password.'; return; }
+  if(!email || !pass) { err.textContent = 'Enter email and password.'; return; }
   btn.disabled = true;
   btn.textContent = 'Signing in…';
   err.textContent = '';
@@ -1173,6 +1254,27 @@ function ocTryUnlock() {
     }
   }
   trySignIn();
+}
+function ocSendOtpLink() {
+  var email = (document.getElementById('oc_lock_email').value || '').trim();
+  var err = document.getElementById('oc_lock_err');
+  var btn = document.getElementById('oc_lock_otp_btn');
+  if (!email) { err.textContent = 'Email is required.'; return; }
+  btn.disabled = true; btn.textContent = 'Sending…'; err.textContent = '';
+  function doSend() {
+    if (window._ocSendOtpLink) {
+      window._ocSendOtpLink(email).then(function(res) {
+        btn.disabled = false; btn.textContent = '📧 Send Sign-In Link';
+        if (res.ok) {
+          document.getElementById('oc_lock_otp_sent').style.display = 'block';
+          btn.style.display = 'none';
+        } else {
+          err.textContent = res.msg || 'Failed to send link.';
+        }
+      });
+    } else { setTimeout(doSend, 300); }
+  }
+  doSend();
 }
 
 /* Called once on page load — Firebase onAuthStateChanged handles auto sign-in
