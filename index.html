@@ -463,7 +463,7 @@ body.light .picker-input{color-scheme:light;}
 <!-- ══ FIREBASE ══ -->
 <script type="module">
 import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
-import { getFirestore, collection, getDocs, query, orderBy, doc, setDoc, deleteDoc } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
+import { getFirestore, collection, getDocs, getDoc, query, orderBy, doc, setDoc, deleteDoc } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
 import { getAuth, signInWithEmailAndPassword, signOut, onAuthStateChanged, sendSignInLinkToEmail, isSignInWithEmailLink, signInWithEmailLink } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
 
 const firebaseConfig = {
@@ -581,6 +581,29 @@ window._ocDeleteAll = async function() {
     await Promise.all(deletes);
     return true;
   } catch(e) { console.error('Firestore delete:', e); return false; }
+};
+
+window._ocSaveSettings = async function(token, clientId) {
+  if (!window._ocCurrentUser) return;
+  try {
+    await setDoc(doc(db, 'oc_settings', 'main'), { dhanToken: token, dhanCid: clientId });
+  } catch(e) { console.warn('OC settings save:', e); }
+};
+
+window._ocLoadSettings = async function() {
+  if (!window._ocCurrentUser) return;
+  try {
+    var snap = await getDoc(doc(db, 'oc_settings', 'main'));
+    if (snap.exists()) {
+      var d = snap.data();
+      if (d.dhanToken) document.getElementById('access_token').value = d.dhanToken;
+      if (d.dhanCid) {
+        document.getElementById('client_id').value = d.dhanCid;
+        document.getElementById('remember_cid').checked = true;
+        try { localStorage.setItem(CID_KEY, d.dhanCid); } catch(e) {}
+      }
+    }
+  } catch(e) { console.warn('OC settings load:', e); }
 };
 
 console.log('OC Firebase Auth ready');
@@ -1145,6 +1168,7 @@ console.log('OC Firebase Auth ready');
 
 var PROXY = 'https://dhan-proxy.asurthedropouttrader.workers.dev';
 var CID_KEY = 'asura_oc_cid';
+var TOKEN_KEY = 'asura_oc_token';
 var currentInst = 'nifty';
 var autoTimer = null;
 var isAutoOn = false;
@@ -1295,6 +1319,7 @@ function ocInitApp() {
   initOICInvert();
   initVCInvert();
   loadSavedCID();
+  if (window._ocLoadSettings) window._ocLoadSettings();
   populateExpiry('nifty');
   renderOIChart();
   renderVegaChart();
@@ -1302,7 +1327,14 @@ function ocInitApp() {
   syncVCDateColorScheme();
   initSoundAlerts();
   document.getElementById('expiry_sel').addEventListener('change',function(){manualExpiry=true;if(lastFetchTime)fetchAll();});
-  function onCredChange(){ renderOIChart(); renderVegaChart(); }
+  var _ocSettingsTimer = null;
+  function onCredChange(){
+    renderOIChart(); renderVegaChart();
+    clearTimeout(_ocSettingsTimer);
+    _ocSettingsTimer = setTimeout(function(){
+      if (window._ocSaveSettings) window._ocSaveSettings(tok(), cid());
+    }, 1000);
+  }
   document.getElementById('access_token').addEventListener('input', onCredChange);
   document.getElementById('client_id').addEventListener('input', onCredChange);
   log('Dashboard loaded — data synced via Firebase. Ready.');
@@ -1653,10 +1685,23 @@ function cid(){ return document.getElementById('client_id').value.trim(); }
 function isLoggedIn(){ return !!(tok() && cid()); }
 function onRememberCID(){
   var cb = document.getElementById('remember_cid');
-  try{ if(cb.checked&&cid()) localStorage.setItem(CID_KEY,cid()); else localStorage.removeItem(CID_KEY); }catch(e){}
+  try{
+    if(cb.checked){
+      if(cid()) localStorage.setItem(CID_KEY, cid());
+      if(tok()) localStorage.setItem(TOKEN_KEY, tok());
+    } else {
+      localStorage.removeItem(CID_KEY);
+      localStorage.removeItem(TOKEN_KEY);
+    }
+  }catch(e){}
 }
 function loadSavedCID(){
-  try{ var s=localStorage.getItem(CID_KEY); if(s){document.getElementById('client_id').value=s;document.getElementById('remember_cid').checked=true;} }catch(e){}
+  try{
+    var s=localStorage.getItem(CID_KEY);
+    if(s){ document.getElementById('client_id').value=s; document.getElementById('remember_cid').checked=true; }
+    var t=localStorage.getItem(TOKEN_KEY);
+    if(t){ document.getElementById('access_token').value=t; }
+  }catch(e){}
 }
 
 /* ── IST helpers ── */
