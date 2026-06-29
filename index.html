@@ -656,7 +656,7 @@ console.log('OC Firebase Auth ready');
       <button class="mob-menu-btn" id="mob_header_btn" onclick="toggleMobileHeaderMenu()" title="More">☰</button>
       <div class="brand">
         <div class="brand-h1">ASURA — OC Dashboard</div>
-        <div class="brand-sub">Nifty 50 · Sensex · Live OI · Bias · Vega · ABMD · v7.1</div>
+        <div class="brand-sub">Nifty 50 · Sensex · Live OI · Bias · Vega · ABMD · v7.2</div>
       </div>
     </div>
     <div class="header-right">
@@ -1156,9 +1156,15 @@ console.log('OC Firebase Auth ready');
 
 <script>
 /* ═══════════════════════════════════════════════════════════
-   ASURA Option Chain Intelligence — v6.10.0
+   ASURA Option Chain Intelligence — v7.2.0
    v6.9: saveSnapshot appends new point to oicPoints directly,
          runs computeAutoBiasMode, stamps correct biasMode.
+   v7.2:  Fix: ABM pills showing '—' on all live rows. Root cause:
+          renderOIChart rebuilds oicPoints from scratch (no biasMode
+          on new array) and write-back loop stamped '—' over the
+          correct value saveSnapshot had just set. Fix: gate the
+          write-back behind !abmdWasPreComputed so live-cycle rows
+          keep their correct ABM pill from saveSnapshot.
    v7.1:  Fix: deferred renderOIChart/stampAllABMD 150ms after Firebase
           load so _ocLoadSettings populates Dhan creds before
           isLoggedIn() is checked — autoBiasMode pills now show
@@ -3481,6 +3487,7 @@ function renderOIChart() {
      for every point including the just-saved snapshot.
      Always run when triggered by user actions (date change, import, etc.)
      where abmdComputedThisCycle will be false.                            */
+  var abmdWasPreComputed = abmdComputedThisCycle;
   if(!abmdComputedThisCycle) {
     computeAutoBiasMode(oicPoints);
   } else {
@@ -3494,19 +3501,25 @@ function renderOIChart() {
   /* ── Write autoBiasMode back into sessionLog for ALL points this date/inst ──
      This retroactively fills '—' entries from historical data that was
      captured before the ABMD feature existed. The ABMD runs on the full
-     oicPoints array so every entry gets the correct mode. ── */
-  oicPoints.forEach(function(pt) {
-    var modeLabel = pt.biasMode === 'raw' ? 'RAW' : pt.biasMode === 'smart' ? 'SMART' : '—';
-    for(var si = 0; si < sessionLog.length; si++) {
-      var s = sessionLog[si];
-      if(logDateToISO(s.date) === filterDate && s.time === pt.time && (s.data||{}).inst === filterInst) {
-        if(s.data) s.data.autoBiasMode = modeLabel;
-        break;
+     oicPoints array so every entry gets the correct mode.
+     SKIP when abmdWasPreComputed: saveSnapshot already ran computeAutoBiasMode
+     on the live oicPoints array and set snap.data.autoBiasMode correctly.
+     renderOIChart rebuilds oicPoints from scratch (no biasMode on points),
+     so running the write-back here would overwrite every entry with '—'. ── */
+  if(!abmdWasPreComputed) {
+    oicPoints.forEach(function(pt) {
+      var modeLabel = pt.biasMode === 'raw' ? 'RAW' : pt.biasMode === 'smart' ? 'SMART' : '—';
+      for(var si = 0; si < sessionLog.length; si++) {
+        var s = sessionLog[si];
+        if(logDateToISO(s.date) === filterDate && s.time === pt.time && (s.data||{}).inst === filterInst) {
+          if(s.data) s.data.autoBiasMode = modeLabel;
+          break;
+        }
       }
-    }
-  });
-  /* Persist updated log */
-  try { localStorage.setItem(SESSION_KEY, JSON.stringify(sessionLog)); } catch(e) {}
+    });
+    /* Persist updated log */
+    try { localStorage.setItem(SESSION_KEY, JSON.stringify(sessionLog)); } catch(e) {}
+  }
   renderLogTable();
 
   /* ── Detect last crossover (raw) ── */
