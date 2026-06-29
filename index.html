@@ -1384,16 +1384,12 @@ function stampAllABMD() {
       abmdLiveRun = false;
       computeAutoBiasMode(pts);
       abmdLiveRun = savedLiveRun;
-      pts.forEach(function(pt) {
-        var modeLabel = pt.biasMode === 'raw' ? 'RAW' : pt.biasMode === 'smart' ? 'SMART' : '---';
-        for(var si = 0; si < sessionLog.length; si++) {
-          var s = sessionLog[si];
-          var sIso = logDateToISO(s.date);
-          if(sIso === pair.date && s.time === pt.time && (s.data||{}).inst === pair.inst) {
-            if(s.data) s.data.autoBiasMode = modeLabel;
-            break;
-          }
-        }
+      /* Write biasMode back using the sorted array which mirrors pair.snaps order */
+      sorted.forEach(function(origSnap, idx) {
+        var pt = pts[idx];
+        if(!pt) return;
+        var modeLabel = pt.biasMode === 'raw' ? 'RAW' : 'SMART';
+        if(origSnap.data) origSnap.data.autoBiasMode = modeLabel;
       });
     });
     log('stampAllABMD: done', 'ok');
