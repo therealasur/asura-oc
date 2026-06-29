@@ -1393,6 +1393,7 @@ function stampAllABMD() {
       });
     });
     log('stampAllABMD: done', 'ok');
+    renderLogTable();
   } catch(e) {
     log('stampAllABMD error: ' + e.message, 'err');
   }
@@ -1407,8 +1408,8 @@ function ocLoadFromFirebase() {
         sessionLog = rows || [];
         if(loadEl) loadEl.style.display = 'none';
         log('Firebase: loaded ' + sessionLog.length + ' snapshots', 'ok');
-        stampAllABMD();
         renderLogTable(); updateHistoryDropdown(); renderOIChart(); renderVegaChart();
+        stampAllABMD();
       }).catch(function(e){
         if(loadEl) loadEl.style.display = 'none';
         log('Firebase load error: ' + e.message, 'err');
