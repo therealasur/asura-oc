@@ -463,7 +463,7 @@ body.light .picker-input{color-scheme:light;}
 <!-- ══ FIREBASE ══ -->
 <script type="module">
 import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
-import { getFirestore, collection, getDocs, getDoc, onSnapshot, query, orderBy, doc, setDoc, deleteDoc } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
+import { getFirestore, collection, getDocs, getDoc, onSnapshot, query, orderBy, where, doc, setDoc, deleteDoc, Timestamp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
 import { getAuth, signInWithEmailAndPassword, signOut, onAuthStateChanged, sendSignInLinkToEmail, isSignInWithEmailLink, signInWithEmailLink } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
 
 const firebaseConfig = {
@@ -564,20 +564,62 @@ window._ocSaveSnapshot = async function(snap) {
 /* Real-time listener handle — kept so we can unsubscribe if needed */
 window._ocUnsubscribeSnapshots = null;
 
+/* ── Split read strategy (fixes free-tier read exhaustion) ──────────────
+   OLD: onSnapshot on entire collection → reads ALL docs on EVERY worker write
+        = 375 writes/day × 2554 docs = ~960K reads/day (19× over free limit)
+
+   NEW:
+   1. getDocs() once on load — fetches all historical docs (past days).
+      Cost: ~2500 reads, paid ONCE per page load.
+   2. onSnapshot scoped to TODAY only — one new doc per worker write.
+      Cost: ≤375 reads/day total.
+
+   Total: ~2875 reads/day vs 960K before. Well within 50K free limit.
+─────────────────────────────────────────────────────────────────────── */
 window._ocSubscribeSnapshots = function(onUpdate) {
   if (!window._ocCurrentUser) return;
-  /* Unsubscribe any existing listener before creating a new one */
+
   if (window._ocUnsubscribeSnapshots) {
     window._ocUnsubscribeSnapshots();
     window._ocUnsubscribeSnapshots = null;
   }
-  var q = query(collection(db, 'oc_sessions'), orderBy('ts', 'desc'));
-  window._ocUnsubscribeSnapshots = onSnapshot(q, function(snap) {
-    var rows = [];
-    snap.forEach(function(d){ rows.push(d.data()); });
-    if (onUpdate) onUpdate(rows);
-  }, function(e) {
-    console.error('Firestore onSnapshot error:', e);
+
+  /* Step 1: one-time historical load */
+  var histQ = query(collection(db, 'oc_sessions'), orderBy('ts', 'desc'));
+  getDocs(histQ).then(function(histSnap) {
+    var allRows = [];
+    histSnap.forEach(function(d){ allRows.push(d.data()); });
+    if (onUpdate) onUpdate(allRows);
+
+    /* Step 2: live listener for TODAY only */
+    var todayStartMs = new Date();
+    todayStartMs.setUTCHours(0, 0, 0, 0);
+    var todayTs = todayStartMs.getTime();
+
+    var liveQ = query(
+      collection(db, 'oc_sessions'),
+      where('ts', '>=', todayTs),
+      orderBy('ts', 'desc')
+    );
+
+    window._ocUnsubscribeSnapshots = onSnapshot(liveQ, function(liveSnap) {
+      var todayMap = {};
+      liveSnap.forEach(function(d){ todayMap[d.id] = d.data(); });
+      var todayIds = Object.keys(todayMap);
+      if (!todayIds.length) return;
+
+      /* Merge today's fresh docs over the historical base */
+      var base = allRows.filter(function(r){ return (r.ts||0) < todayTs; });
+      var todayRows = todayIds.map(function(id){ return todayMap[id]; });
+      todayRows.sort(function(a,b){ return (b.ts||0)-(a.ts||0); });
+      allRows = todayRows.concat(base);
+      if (onUpdate) onUpdate(allRows);
+    }, function(e) {
+      console.error('Firestore onSnapshot error:', e);
+    });
+
+  }).catch(function(e) {
+    console.error('Firestore historical load error:', e);
   });
 };
 
