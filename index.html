@@ -1346,6 +1346,62 @@ function ocInitApp() {
 }
 
 /* ── Firebase: load snapshots ── */
+function stampAllABMD() {
+  try {
+    var pairs = {};
+    sessionLog.forEach(function(s) {
+      var d = s.data || {};
+      if(!d.inst || d.netCeChg == null || d.netPeChg == null) return;
+      var iso = logDateToISO(s.date);
+      if(!iso) return;
+      var key = d.inst + '|' + iso;
+      if(!pairs[key]) pairs[key] = { inst: d.inst, date: iso, snaps: [] };
+      pairs[key].snaps.push(s);
+    });
+    var pairKeys = Object.keys(pairs);
+    log('stampAllABMD: processing ' + pairKeys.length + ' inst+date pairs', 'ok');
+    pairKeys.forEach(function(key) {
+      var pair = pairs[key];
+      var sorted = pair.snaps.slice().sort(function(a, b) {
+        return timeToMinutes(a.time) - timeToMinutes(b.time);
+      });
+      var pts = sorted.map(function(s) {
+        var d = s.data;
+        return {
+          time: s.time, date: s.date,
+          ce: (d.netCeChg||0) / 100000,
+          pe: (d.netPeChg||0) / 100000,
+          spot: d.spot, atm: d.atm,
+          bias: d.overallBias || '---',
+          rawBias: d.overallBiasRaw || d.overallBias || '---',
+          netPeChgRaw: (d.netPeChg||0),
+          netCeChgRaw: (d.netCeChg||0),
+          candleHigh: d.candleHigh != null ? parseFloat(d.candleHigh) : null,
+          candleLow:  d.candleLow  != null ? parseFloat(d.candleLow)  : null
+        };
+      });
+      var savedLiveRun = abmdLiveRun;
+      abmdLiveRun = false;
+      computeAutoBiasMode(pts);
+      abmdLiveRun = savedLiveRun;
+      pts.forEach(function(pt) {
+        var modeLabel = pt.biasMode === 'raw' ? 'RAW' : pt.biasMode === 'smart' ? 'SMART' : '---';
+        for(var si = 0; si < sessionLog.length; si++) {
+          var s = sessionLog[si];
+          var sIso = logDateToISO(s.date);
+          if(sIso === pair.date && s.time === pt.time && (s.data||{}).inst === pair.inst) {
+            if(s.data) s.data.autoBiasMode = modeLabel;
+            break;
+          }
+        }
+      });
+    });
+    log('stampAllABMD: done', 'ok');
+  } catch(e) {
+    log('stampAllABMD error: ' + e.message, 'err');
+  }
+}
+
 function ocLoadFromFirebase() {
   var loadEl = document.getElementById('fb_loading_status');
   if(loadEl) loadEl.style.display = 'block';
@@ -1354,6 +1410,7 @@ function ocLoadFromFirebase() {
       window._ocLoadSnapshots().then(function(rows) {
         sessionLog = rows || [];
         if(loadEl) loadEl.style.display = 'none';
+        stampAllABMD();
         renderLogTable(); updateHistoryDropdown(); renderOIChart(); renderVegaChart();
         log('Firebase: loaded ' + sessionLog.length + ' snapshots', 'ok');
       }).catch(function(e){
