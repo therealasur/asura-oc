@@ -656,7 +656,7 @@ console.log('OC Firebase Auth ready');
       <button class="mob-menu-btn" id="mob_header_btn" onclick="toggleMobileHeaderMenu()" title="More">☰</button>
       <div class="brand">
         <div class="brand-h1">ASURA — OC Dashboard</div>
-        <div class="brand-sub">Nifty 50 · Sensex · Live OI · Bias · Vega · ABMD · v7.0</div>
+        <div class="brand-sub">Nifty 50 · Sensex · Live OI · Bias · Vega · ABMD · v7.1</div>
       </div>
     </div>
     <div class="header-right">
@@ -1159,6 +1159,11 @@ console.log('OC Firebase Auth ready');
    ASURA Option Chain Intelligence — v6.10.0
    v6.9: saveSnapshot appends new point to oicPoints directly,
          runs computeAutoBiasMode, stamps correct biasMode.
+   v7.1:  Fix: deferred renderOIChart/stampAllABMD 150ms after Firebase
+          load so _ocLoadSettings populates Dhan creds before
+          isLoggedIn() is checked — autoBiasMode pills now show
+          correctly on page load. stampAllABMD modeLabel now has
+          '—' fallback for undefined biasMode.
    v6.10: eliminated double ABMD compute per fetch cycle via
           abmdComputedThisCycle flag — renderOIChart skips its
           own compute when saveSnapshot already ran it.
@@ -1388,7 +1393,7 @@ function stampAllABMD() {
       sorted.forEach(function(origSnap, idx) {
         var pt = pts[idx];
         if(!pt) return;
-        var modeLabel = pt.biasMode === 'raw' ? 'RAW' : 'SMART';
+        var modeLabel = pt.biasMode === 'raw' ? 'RAW' : pt.biasMode === 'smart' ? 'SMART' : '—';
         if(origSnap.data) origSnap.data.autoBiasMode = modeLabel;
       });
     });
@@ -1408,8 +1413,17 @@ function ocLoadFromFirebase() {
         sessionLog = rows || [];
         if(loadEl) loadEl.style.display = 'none';
         log('Firebase: loaded ' + sessionLog.length + ' snapshots', 'ok');
-        renderLogTable(); updateHistoryDropdown(); renderOIChart(); renderVegaChart();
-        stampAllABMD();
+        renderLogTable(); updateHistoryDropdown();
+        /* Defer chart render + ABMD stamp by 150ms so _ocLoadSettings
+           has time to populate Dhan token/clientId inputs before
+           renderOIChart() checks isLoggedIn(). Without this defer,
+           isLoggedIn() returns false on first load, renderOIChart exits
+           early, the autoBiasMode write-back never runs, and all pills
+           remain showing '—' in the session log table.              */
+        setTimeout(function() {
+          renderOIChart(); renderVegaChart();
+          stampAllABMD();
+        }, 150);
       }).catch(function(e){
         if(loadEl) loadEl.style.display = 'none';
         log('Firebase load error: ' + e.message, 'err');
