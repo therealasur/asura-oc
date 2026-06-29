@@ -656,7 +656,7 @@ console.log('OC Firebase Auth ready');
       <button class="mob-menu-btn" id="mob_header_btn" onclick="toggleMobileHeaderMenu()" title="More">☰</button>
       <div class="brand">
         <div class="brand-h1">ASURA — OC Dashboard</div>
-        <div class="brand-sub">Nifty 50 · Sensex · Live OI · Bias · Vega · ABMD · v7.2</div>
+        <div class="brand-sub">Nifty 50 · Sensex · Live OI · Bias · Vega · ABMD · v7.3</div>
       </div>
     </div>
     <div class="header-right">
@@ -1156,9 +1156,18 @@ console.log('OC Firebase Auth ready');
 
 <script>
 /* ═══════════════════════════════════════════════════════════
-   ASURA Option Chain Intelligence — v7.2.0
-   v6.9: saveSnapshot appends new point to oicPoints directly,
-         runs computeAutoBiasMode, stamps correct biasMode.
+   ASURA Option Chain Intelligence — v7.3.0
+   v7.3:  Fix: Current Mode banner always shows correct RAW/SMART state.
+          Root cause: renderOIChart reassigns oicPoints to a brand-new
+          array — biasMode stamped by saveSnapshot was lost on the old
+          objects. The abmdComputedThisCycle skip-flag therefore read
+          stale/undefined biasMode, causing banner to always show SMART.
+          Fix: always recompute ABMD on the freshly-built oicPoints array;
+          it's a cheap O(N) pass, not the bottleneck.
+          Also: Wake Lock + visibilitychange catch-up fetch — auto-refresh
+          now self-heals when tab returns to foreground after being hidden,
+          and attempts to hold the screen wake lock while auto is running
+          to reduce timer throttling on Chrome/Edge/Android.
    v7.2:  Fix: ABM pills showing '—' on all live rows. Root cause:
           renderOIChart rebuilds oicPoints from scratch (no biasMode
           on new array) and write-back loop stamped '—' over the
@@ -3482,17 +3491,21 @@ function renderOIChart() {
   }
 
   /* ── AUTO BIAS DETECTOR: tag each point with recommended mode ──
-     Skip if saveSnapshot already ran computeAutoBiasMode this cycle
-     (abmdComputedThisCycle=true). oicPoints already has correct biasMode
-     for every point including the just-saved snapshot.
-     Always run when triggered by user actions (date change, import, etc.)
-     where abmdComputedThisCycle will be false.                            */
-  var abmdWasPreComputed = abmdComputedThisCycle;
-  if(!abmdComputedThisCycle) {
-    computeAutoBiasMode(oicPoints);
-  } else {
-    log('renderOIChart: ABMD already computed this cycle — skipping duplicate run', 'ok');
-  }
+     v7.3 FIX: oicPoints is REASSIGNED above (oicPoints = snaps.map(...)),
+     which builds brand-new point objects from sessionLog. Those new objects
+     never carry the biasMode that saveSnapshot() stamped onto the OLD
+     (now-discarded) oicPoints array/objects — object identity is lost on
+     reassignment. The abmdComputedThisCycle skip-flag was trusting biasMode
+     to have survived that reassignment, which it never does. Every point's
+     biasMode came back undefined, so the live "Current Mode" banner's
+     `lMode === 'raw'` check always fell through to the SMART MONEY branch —
+     even while the Session Logger (which reads autoBiasMode straight from
+     the saved Firestore doc, a separate code path) correctly showed RAW.
+     Fix: ALWAYS recompute on this fresh array. computeAutoBiasMode is a
+     cheap O(N) pass over already-in-memory points — recomputing every
+     render is not the bottleneck this flag was trying to avoid; the
+     bottleneck was a full renderOIChart() re-draw, which this does anyway. */
+  computeAutoBiasMode(oicPoints);
   abmdComputedThisCycle = false; /* reset for next cycle */
   renderAutoBiasTimeline(oicPoints, filterDate);
   /* Sync ABMD date selector with OI chart date */
@@ -3501,25 +3514,19 @@ function renderOIChart() {
   /* ── Write autoBiasMode back into sessionLog for ALL points this date/inst ──
      This retroactively fills '—' entries from historical data that was
      captured before the ABMD feature existed. The ABMD runs on the full
-     oicPoints array so every entry gets the correct mode.
-     SKIP when abmdWasPreComputed: saveSnapshot already ran computeAutoBiasMode
-     on the live oicPoints array and set snap.data.autoBiasMode correctly.
-     renderOIChart rebuilds oicPoints from scratch (no biasMode on points),
-     so running the write-back here would overwrite every entry with '—'. ── */
-  if(!abmdWasPreComputed) {
-    oicPoints.forEach(function(pt) {
-      var modeLabel = pt.biasMode === 'raw' ? 'RAW' : pt.biasMode === 'smart' ? 'SMART' : '—';
-      for(var si = 0; si < sessionLog.length; si++) {
-        var s = sessionLog[si];
-        if(logDateToISO(s.date) === filterDate && s.time === pt.time && (s.data||{}).inst === filterInst) {
-          if(s.data) s.data.autoBiasMode = modeLabel;
-          break;
-        }
+     oicPoints array so every entry gets the correct mode. ── */
+  oicPoints.forEach(function(pt) {
+    var modeLabel = pt.biasMode === 'raw' ? 'RAW' : pt.biasMode === 'smart' ? 'SMART' : '—';
+    for(var si = 0; si < sessionLog.length; si++) {
+      var s = sessionLog[si];
+      if(logDateToISO(s.date) === filterDate && s.time === pt.time && (s.data||{}).inst === filterInst) {
+        if(s.data) s.data.autoBiasMode = modeLabel;
+        break;
       }
-    });
-    /* Persist updated log */
-    try { localStorage.setItem(SESSION_KEY, JSON.stringify(sessionLog)); } catch(e) {}
-  }
+    }
+  });
+  /* Persist updated log */
+  try { localStorage.setItem(SESSION_KEY, JSON.stringify(sessionLog)); } catch(e) {}
   renderLogTable();
 
   /* ── Detect last crossover (raw) ── */
@@ -5399,6 +5406,45 @@ var smartRetryCount   = 0;   /* how many retries fired this minute */
 var eodSnapshotFired  = false;
 var eodFiredDate      = '';
 
+/* ── Screen Wake Lock — best-effort mitigation against background-tab
+   timer throttling. Supported on Chrome/Edge/Android (incl. when the tab
+   is merely backgrounded, not just screen-off); NOT supported on Firefox
+   or Safari/iOS (no API at all there — silently no-ops, which is fine,
+   the catch-up fetch below covers those browsers instead).
+   Does NOT guarantee every single 1-min candle is captured while hidden
+   on every platform — no client-side web API can promise that (see
+   visibilitychange catch-up below for the safety net on top of this). */
+var wakeLock = null;
+async function acquireWakeLock(){
+  if(!('wakeLock' in navigator)) return;
+  try{
+    wakeLock = await navigator.wakeLock.request('screen');
+    log('🔒 Wake Lock acquired — helps keep auto-refresh alive while tab is backgrounded', 'ok');
+    wakeLock.addEventListener('release', function(){
+      log('🔓 Wake Lock released (system/browser revoked it)', 'warn');
+      wakeLock = null;
+    });
+  }catch(e){
+    log('Wake Lock request failed: ' + e.message, 'warn');
+  }
+}
+function releaseWakeLock(){
+  if(wakeLock){ try{ wakeLock.release(); }catch(e){} wakeLock = null; }
+}
+/* Re-acquire on visibility return (the lock auto-releases when tab is
+   hidden on some platforms) AND fire an immediate catch-up fetch in case
+   a candle closed while we were away — this is the real safety net,
+   since Wake Lock support is partial across browsers. */
+document.addEventListener('visibilitychange', function(){
+  if(!document.hidden){
+    if(smartAutoTimer && !wakeLock) acquireWakeLock();
+    if(smartAutoTimer && isMarketOpen() && tok() && cid() && !isFetching){
+      log('⏱ Tab visible again — firing catch-up fetch in case a candle was missed', 'ok');
+      doAutoFetch(false);
+    }
+  }
+});
+
 /* ── Correct IST second/minute using Intl — works regardless of browser TZ ── */
 function getISTTime() {
   var now = new Date();
@@ -5425,6 +5471,8 @@ function startSmartAuto(){
   if(eodFiredDate !== todayStr) { eodSnapshotFired = false; eodFiredDate = todayStr; }
 
   /* Tick every 250ms for tighter second-boundary detection */
+  acquireWakeLock();
+
   smartAutoTimer = setInterval(function(){
     if(!isMarketOpen()){ setLiveBadge('closed'); return; }
     if(!tok() || !cid()) return;
@@ -5506,6 +5554,7 @@ function stopSmartAuto(){
   if(smartRetryTimer){ clearTimeout(smartRetryTimer); smartRetryTimer=null; }
   smartLastMinute = -1;
   smartRetryCount = 0;
+  releaseWakeLock();
   log('⏱ Smart auto-refresh STOPPED', 'ok');
 }
 
