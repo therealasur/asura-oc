@@ -463,7 +463,7 @@ body.light .picker-input{color-scheme:light;}
 <!-- ══ FIREBASE ══ -->
 <script type="module">
 import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
-import { getFirestore, collection, getDocs, getDoc, query, orderBy, doc, setDoc, deleteDoc } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
+import { getFirestore, collection, getDocs, getDoc, onSnapshot, query, orderBy, doc, setDoc, deleteDoc } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
 import { getAuth, signInWithEmailAndPassword, signOut, onAuthStateChanged, sendSignInLinkToEmail, isSignInWithEmailLink, signInWithEmailLink } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
 
 const firebaseConfig = {
@@ -561,15 +561,24 @@ window._ocSaveSnapshot = async function(snap) {
   } catch(e) { console.error('Firestore save:', e); return false; }
 };
 
-window._ocLoadSnapshots = async function() {
-  if (!window._ocCurrentUser) return [];
-  try {
-    var q = query(collection(db, 'oc_sessions'), orderBy('ts', 'desc'));
-    var snap = await getDocs(q);
+/* Real-time listener handle — kept so we can unsubscribe if needed */
+window._ocUnsubscribeSnapshots = null;
+
+window._ocSubscribeSnapshots = function(onUpdate) {
+  if (!window._ocCurrentUser) return;
+  /* Unsubscribe any existing listener before creating a new one */
+  if (window._ocUnsubscribeSnapshots) {
+    window._ocUnsubscribeSnapshots();
+    window._ocUnsubscribeSnapshots = null;
+  }
+  var q = query(collection(db, 'oc_sessions'), orderBy('ts', 'desc'));
+  window._ocUnsubscribeSnapshots = onSnapshot(q, function(snap) {
     var rows = [];
     snap.forEach(function(d){ rows.push(d.data()); });
-    return rows;
-  } catch(e) { console.error('Firestore load:', e); return []; }
+    if (onUpdate) onUpdate(rows);
+  }, function(e) {
+    console.error('Firestore onSnapshot error:', e);
+  });
 };
 
 window._ocDeleteAll = async function() {
@@ -583,10 +592,12 @@ window._ocDeleteAll = async function() {
   } catch(e) { console.error('Firestore delete:', e); return false; }
 };
 
-window._ocSaveSettings = async function(token, clientId) {
+window._ocSaveSettings = async function(token, clientId, selectedInst, selectedExpiry) {
   if (!window._ocCurrentUser) return;
   try {
-    await setDoc(doc(db, 'oc_settings', 'main'), { dhanToken: token, dhanCid: clientId });
+    var payload = { dhanToken: token, dhanCid: clientId, selectedInst: selectedInst || 'nifty' };
+    if (selectedExpiry) payload.selectedExpiry = selectedExpiry;
+    await setDoc(doc(db, 'oc_settings', 'main'), payload, { merge: true });
   } catch(e) { console.warn('OC settings save:', e); }
 };
 
@@ -656,7 +667,7 @@ console.log('OC Firebase Auth ready');
       <button class="mob-menu-btn" id="mob_header_btn" onclick="toggleMobileHeaderMenu()" title="More">☰</button>
       <div class="brand">
         <div class="brand-h1">ASURA — OC Dashboard</div>
-        <div class="brand-sub">Nifty 50 · Sensex · Live OI · Bias · Vega · ABMD · v7.3.1</div>
+        <div class="brand-sub">Nifty 50 · Sensex · Live OI · Bias · Vega · ABMD · v7.2</div>
       </div>
     </div>
     <div class="header-right">
@@ -666,7 +677,7 @@ console.log('OC Firebase Auth ready');
       <div class="invert-badge" id="invert_active_badge">🔄 INVERTED</div>
       <span class="updated-txt" id="updated_txt"></span>
       <div class="spinner" id="spinner"></div>
-      <button class="icon-btn" onclick="fetchAll()" title="Refresh">&#8635;</button>
+      <button class="icon-btn" onclick="triggerWorkerNow()" title="Refresh">&#8635;</button>
       <button class="icon-btn" id="theme_btn" onclick="toggleTheme()" title="Toggle theme">🌙</button>
       <button class="icon-btn" onclick="ocDoSignOut()" title="Sign out" onmouseover="this.style.background='rgba(240,69,69,0.1)';this.style.borderColor='rgba(240,69,69,0.3)';this.querySelector('svg').style.stroke='#f04545';" onmouseout="this.style.background='';this.style.borderColor='';this.querySelector('svg').style.stroke='';">
         <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" style="transition:stroke 0.15s;">
@@ -701,16 +712,12 @@ console.log('OC Firebase Auth ready');
         <div style="font-size:10px;color:var(--text3);">🔒 Credentials stay in browser memory only — never sent anywhere except Dhan's servers.</div>
       </div>
       <div class="config-action-col">
-        <button class="btn-fetch" onclick="fetchAll()" id="fetch_btn" style="padding:14px 32px;font-size:14px;height:auto;min-width:160px;">⚡ Fetch Both</button>
+        <button class="btn-fetch" onclick="triggerWorkerNow()" id="fetch_btn" style="padding:14px 32px;font-size:14px;height:auto;min-width:160px;">⚡ Fetch Now</button>
         <button class="debug-toggle-btn" onclick="toggleDebug()" id="debug_toggle_btn">🐞 Show debug log</button>
         <button class="debug-toggle-btn" onclick="copyDebugLog()" id="debug_copy_btn" style="display:none;">📋 Copy log</button>
       </div>
     </div>
-    <div class="auto-row">
-      <label class="toggle"><input type="checkbox" id="auto_toggle" onchange="toggleAuto()"><span class="slider-t"></span></label>
-      <span class="auto-label">Auto-refresh — syncs to 1-min candle close</span>
-      <span id="auto_status" style="font-size:11px;font-weight:600;color:var(--text3);">Off</span>
-    </div>
+    <!-- Worker-mode: browser is a pure Firestore reader. No auto-refresh toggle needed. -->
 
     <!-- INVERT BIAS TOGGLE -->
     <div class="invert-bias-row" id="invert_bias_row" style="margin-top:10px;">
@@ -1156,21 +1163,9 @@ console.log('OC Firebase Auth ready');
 
 <script>
 /* ═══════════════════════════════════════════════════════════
-   ASURA Option Chain Intelligence — v7.3.1
-   v7.3.1: Auto-save access token to Firestore on every successful fetch.
-           Token now stays synced across all devices/browsers without
-           re-pasting after reload. (oc_settings/main is the single source of truth.)
-   v7.3.0 (prev): Fix: Current Mode banner always shows correct RAW/SMART state.
-          Root cause: renderOIChart reassigns oicPoints to a brand-new
-          array — biasMode stamped by saveSnapshot was lost on the old
-          objects. The abmdComputedThisCycle skip-flag therefore read
-          stale/undefined biasMode, causing banner to always show SMART.
-          Fix: always recompute ABMD on the freshly-built oicPoints array;
-          it's a cheap O(N) pass, not the bottleneck.
-          Also: Wake Lock + visibilitychange catch-up fetch — auto-refresh
-          now self-heals when tab returns to foreground after being hidden,
-          and attempts to hold the screen wake lock while auto is running
-          to reduce timer throttling on Chrome/Edge/Android.
+   ASURA Option Chain Intelligence — v7.2.0
+   v6.9: saveSnapshot appends new point to oicPoints directly,
+         runs computeAutoBiasMode, stamps correct biasMode.
    v7.2:  Fix: ABM pills showing '—' on all live rows. Root cause:
           renderOIChart rebuilds oicPoints from scratch (no biasMode
           on new array) and write-back loop stamped '—' over the
@@ -1190,13 +1185,27 @@ console.log('OC Firebase Auth ready');
 ═══════════════════════════════════════════════════════════ */
 
 var PROXY = 'https://dhan-proxy.asurthedropouttrader.workers.dev';
+
+/* Fire-and-forget: tells the worker to run its cron pipeline immediately
+   instead of waiting for the next 1-min tick. Called after instrument or
+   expiry switches so the dashboard gets fresh data within a few seconds.
+   No UI blocking, no spinner, no awaited response — failures are silently
+   logged since the next natural cron tick is a built-in fallback. */
+function triggerWorkerFetch(reason){
+  try{
+    fetch(PROXY + '/trigger', { method: 'POST' })
+      .then(function(r){ log('Trigger (' + reason + '): ' + (r.ok ? 'OK' : 'HTTP ' + r.status), r.ok ? 'ok' : 'warn'); })
+      .catch(function(e){ log('Trigger (' + reason + ') failed: ' + e.message, 'warn'); });
+  }catch(e){ /* fetch not available — ignore, cron will catch up within 1 min */ }
+}
+
 var CID_KEY = 'asura_oc_cid';
 var TOKEN_KEY = 'asura_oc_token';
 var SESSION_KEY = 'asura_oc_session_v1';
 var WARN_THRESHOLD = 80;
 var currentInst = 'nifty';
 var autoTimer = null;
-var isAutoOn = false;
+var isAutoOn = true;  /* always-on — toggle removed from UI */
 var lastFetchTime = null;
 var vixGlobal = null;
 var lastVixFetch = 0;      /* timestamp of last successful VIX fetch */
@@ -1351,13 +1360,26 @@ function ocInitApp() {
   syncOICDateColorScheme();
   syncVCDateColorScheme();
   initSoundAlerts();
-  document.getElementById('expiry_sel').addEventListener('change',function(){manualExpiry=true;if(lastFetchTime)fetchAll();});
+  document.getElementById('expiry_sel').addEventListener('change',function(){
+    manualExpiry=true;
+    /* Worker-mode: just refresh display; triggerWorkerFetch below handles new data */
+    /* Persist the manually-chosen expiry and trigger an immediate cron run so
+       the new expiry's option chain lands within a few seconds instead of
+       waiting up to 60s for the next tick. */
+    if (window._ocSaveSettings) {
+      var tok = (document.getElementById('access_token')||{}).value||'';
+      var cid = (document.getElementById('client_id')||{}).value||'';
+      var expiry = (document.getElementById('expiry_sel')||{}).value||'';
+      window._ocSaveSettings(tok, cid, currentInst, expiry);
+    }
+    triggerWorkerFetch('expiry change → ' + ((document.getElementById('expiry_sel')||{}).value||''));
+  });
   var _ocSettingsTimer = null;
   function onCredChange(){
     renderOIChart(); renderVegaChart();
     clearTimeout(_ocSettingsTimer);
     _ocSettingsTimer = setTimeout(function(){
-      if (window._ocSaveSettings) window._ocSaveSettings(tok(), cid());
+      if (window._ocSaveSettings) window._ocSaveSettings(tok(), cid(), currentInst);
     }, 1000);
   }
   document.getElementById('access_token').addEventListener('input', onCredChange);
@@ -1425,32 +1447,39 @@ function stampAllABMD() {
 function ocLoadFromFirebase() {
   var loadEl = document.getElementById('fb_loading_status');
   if(loadEl) loadEl.style.display = 'block';
-  function tryLoad() {
-    if(window._ocLoadSnapshots) {
-      window._ocLoadSnapshots().then(function(rows) {
+  var firstLoad = true;
+  function trySubscribe() {
+    if(window._ocSubscribeSnapshots) {
+      window._ocSubscribeSnapshots(function(rows) {
         sessionLog = rows || [];
         if(loadEl) loadEl.style.display = 'none';
-        log('Firebase: loaded ' + sessionLog.length + ' snapshots', 'ok');
-        renderLogTable(); updateHistoryDropdown();
-        /* Defer chart render + ABMD stamp by 150ms so _ocLoadSettings
-           has time to populate Dhan token/clientId inputs before
-           renderOIChart() checks isLoggedIn(). Without this defer,
-           isLoggedIn() returns false on first load, renderOIChart exits
-           early, the autoBiasMode write-back never runs, and all pills
-           remain showing '—' in the session log table.              */
-        setTimeout(function() {
+        if(firstLoad) {
+          firstLoad = false;
+          log('Firebase: loaded ' + sessionLog.length + ' snapshots (real-time listener active)', 'ok');
+          renderLogTable(); updateHistoryDropdown();
+          /* Defer chart render + ABMD stamp by 150ms so _ocLoadSettings
+             has time to populate Dhan token/clientId inputs before
+             renderOIChart() checks isLoggedIn(). Without this defer,
+             isLoggedIn() returns false on first load, renderOIChart exits
+             early, the autoBiasMode write-back never runs, and all pills
+             remain showing '—' in the session log table.              */
+          setTimeout(function() {
+            renderOIChart(); renderVegaChart();
+            stampAllABMD();
+            /* Worker-mode: browser is a pure Firestore reader — no auto-fetch needed */
+          }, 150);
+        } else {
+          log('Firebase: snapshots updated (' + sessionLog.length + ' total)', 'ok');
+          renderLogTable(); updateHistoryDropdown();
           renderOIChart(); renderVegaChart();
           stampAllABMD();
-        }, 150);
-      }).catch(function(e){
-        if(loadEl) loadEl.style.display = 'none';
-        log('Firebase load error: ' + e.message, 'err');
+        }
       });
     } else {
-      setTimeout(tryLoad, 300);
+      setTimeout(trySubscribe, 300);
     }
   }
-  tryLoad();
+  trySubscribe();
 }
 
 /* ── Firebase: save one snapshot ── */
@@ -1966,7 +1995,18 @@ function setInst(inst){
   oicNeverDrawn = true;
   populateExpiry(inst);
   renderOIChart(); /* refresh chart for new instrument */
-  if(lastFetchTime) fetchAll();
+  /* Worker-mode: triggerWorkerFetch below handles fetching new instrument data */
+  /* Persist selected instrument + its now-default expiry to Firestore so the
+     worker knows which to process, then trigger an immediate cron run so the
+     new instrument's data lands within a few seconds instead of waiting up
+     to 60s for the next tick. */
+  if (window._ocSaveSettings) {
+    var tok = (document.getElementById('access_token')||{}).value||'';
+    var cid = (document.getElementById('client_id')||{}).value||'';
+    var expiry = (document.getElementById('expiry_sel')||{}).value||'';
+    window._ocSaveSettings(tok, cid, inst, expiry);
+  }
+  triggerWorkerFetch('instrument switch → ' + inst);
 }
 
 function populateExpiry(inst){
@@ -2006,7 +2046,7 @@ function clearErr(){document.getElementById('err_box').style.display='none';}
 /* ── Error dialog ── */
 function classifyFetchError(errMsg){
   var m=errMsg||'';
-  if(/429|rate.?limit|too.?many|DH-906/i.test(m))return{icon:'⏱',title:'Rate Limited (429)',body:'Too many requests to Dhan API in a short time.',sub:'Dhan enforces a 1-request/second limit. The auto-refresh at 60s is designed to stay within this. Multiple manual fetches on top of auto-refresh can trigger it.',action:'1. Wait 30–60 seconds.\n2. Turn off auto-refresh temporarily if doing manual testing.\n3. Retry fetch once.'};
+  if(/429|rate.?limit|too.?many|DH-906/i.test(m))return{icon:'⏱',title:'Rate Limited (429)',body:'Too many requests to Dhan API in a short time.',sub:'Dhan enforces a 1-request/second limit. The auto-refresh at 60s is designed to stay within this. Multiple rapid manual fetches can trigger it.',action:'1. Wait 30–60 seconds.\n2. Avoid rapid manual fetches during market hours.\n3. Retry fetch once.'};
   if(/401|Authentication Failed|Client ID or Token|auth/i.test(m))return{icon:'🔑',title:'Authentication Failure',body:'Your Dhan access token or Client ID was rejected.',sub:'Token may have expired (Dhan tokens expire daily) or was copied incorrectly.',action:'1. Go to Dhan HQ → Open API → regenerate token.\n2. Paste new token above.\n3. Re-enter Client ID and hit Fetch Both.'};
   if(/403|Forbidden/i.test(m))return{icon:'🚫',title:'Access Forbidden (403)',body:'Server refused — token valid but lacks permission.',sub:'Dhan API subscription may have lapsed.',action:'1. Verify your Dhan Open API subscription is active.\n2. Regenerate access token and try again.'};
   if(/HTML response|CORS|Cloudflare|cloudflare|503|502|504|upstream/i.test(m))return{icon:'☁️',title:'Cloudflare / Proxy Error',body:'Proxy returned HTML instead of JSON.',sub:'Dhan API may be down or Cloudflare worker is blocking.',action:'1. Wait 2–5 minutes and retry.\n2. Check https://status.dhan.co\n3. If persistent, proxy worker may need redeployment.'};
@@ -2030,7 +2070,7 @@ function showFetchErrModal(errMsg, affected){
   log('🚨 FETCH ERROR MODAL: '+c.title+' | '+errMsg, 'err');
 }
 function dismissFetchErr(){ document.getElementById('fetch_err_modal').classList.remove('visible'); }
-function retryFetch(){ dismissFetchErr(); setTimeout(function(){if(!isFetching)fetchAll();},600); }
+function retryFetch(){ dismissFetchErr(); triggerWorkerNow(); }
 
 /* ── VIX fetch — scrip CSV cached for 5 min ── */
 var vixScripId=null;
@@ -2202,9 +2242,6 @@ async function fetchAll(snapType){
       setLoading(false);setLiveBadge('outdated'); return false;
     }
     lastFetchTime=Date.now();
-    /* Auto-persist the token that just worked — keeps oc_settings/main fresh
-       across all devices without the user having to re-paste after a reload. */
-    if (window._ocSaveSettings && tok() && cid()) window._ocSaveSettings(tok(), cid());
     document.getElementById('updated_txt').textContent='Updated '+new Date().toLocaleTimeString('en-IN');
     setLiveBadge(isMarketOpen() ? 'live' : 'closed'); /* holiday/weekend: show closed not live */
     try{
@@ -2215,23 +2252,14 @@ async function fetchAll(snapType){
          network call needed here. isMarketOpen() is safe to call immediately. */
       checkBiasChangeAlert();
       if(isMarketOpen()){
-        abmdLiveRun = true;   /* allow ABMD alerts for this live fetch only */
-        /* v6.9 ORDER:
-           1. saveSnapshot — appends the new point to oicPoints directly,
-              re-runs computeAutoBiasMode on the extended array, stamps the
-              correct biasMode onto this snapshot before persisting.
-              abmdLiveRun=true here so a fresh FC/FU/exit on the new
-              trailing point fires the sound alert correctly.
-           2. abmdLiveRun=false — cleared before renderOIChart so the
-              full historical replay inside renderOIChart never re-fires alerts.
-           3. renderOIChart — redraws the chart visually (oicPoints already
-              updated by saveSnapshot, no functional ABMD work needed here). */
-        saveSnapshot(snapType);
-        abmdLiveRun = false;
+        /* Worker-mode: browser never writes snapshots.
+           Just re-render the chart/vega with the latest processAndRender output
+           so the user sees fresh data immediately (worker's onSnapshot will
+           also arrive within ~3-5s if triggerWorkerNow() was used). */
         renderOIChart();
         renderVegaChart();
       }else{
-        log('Fetch completed outside market hours'+(isTradingHoliday()?' (NSE holiday: '+getIST().isoDate+')':'')+' — snapshot not saved','warn');
+        log('Fetch completed outside market hours'+(isTradingHoliday()?' (NSE holiday: '+getIST().isoDate+')':'')+' — display updated (no snapshot written in worker-mode)','warn');
       }
     }catch(renderErr){
       log('RENDER ERROR: '+renderErr.message,'err');
@@ -3497,21 +3525,17 @@ function renderOIChart() {
   }
 
   /* ── AUTO BIAS DETECTOR: tag each point with recommended mode ──
-     v7.3 FIX: oicPoints is REASSIGNED above (oicPoints = snaps.map(...)),
-     which builds brand-new point objects from sessionLog. Those new objects
-     never carry the biasMode that saveSnapshot() stamped onto the OLD
-     (now-discarded) oicPoints array/objects — object identity is lost on
-     reassignment. The abmdComputedThisCycle skip-flag was trusting biasMode
-     to have survived that reassignment, which it never does. Every point's
-     biasMode came back undefined, so the live "Current Mode" banner's
-     `lMode === 'raw'` check always fell through to the SMART MONEY branch —
-     even while the Session Logger (which reads autoBiasMode straight from
-     the saved Firestore doc, a separate code path) correctly showed RAW.
-     Fix: ALWAYS recompute on this fresh array. computeAutoBiasMode is a
-     cheap O(N) pass over already-in-memory points — recomputing every
-     render is not the bottleneck this flag was trying to avoid; the
-     bottleneck was a full renderOIChart() re-draw, which this does anyway. */
-  computeAutoBiasMode(oicPoints);
+     Skip if saveSnapshot already ran computeAutoBiasMode this cycle
+     (abmdComputedThisCycle=true). oicPoints already has correct biasMode
+     for every point including the just-saved snapshot.
+     Always run when triggered by user actions (date change, import, etc.)
+     where abmdComputedThisCycle will be false.                            */
+  var abmdWasPreComputed = abmdComputedThisCycle;
+  if(!abmdComputedThisCycle) {
+    computeAutoBiasMode(oicPoints);
+  } else {
+    log('renderOIChart: ABMD already computed this cycle — skipping duplicate run', 'ok');
+  }
   abmdComputedThisCycle = false; /* reset for next cycle */
   renderAutoBiasTimeline(oicPoints, filterDate);
   /* Sync ABMD date selector with OI chart date */
@@ -3520,19 +3544,25 @@ function renderOIChart() {
   /* ── Write autoBiasMode back into sessionLog for ALL points this date/inst ──
      This retroactively fills '—' entries from historical data that was
      captured before the ABMD feature existed. The ABMD runs on the full
-     oicPoints array so every entry gets the correct mode. ── */
-  oicPoints.forEach(function(pt) {
-    var modeLabel = pt.biasMode === 'raw' ? 'RAW' : pt.biasMode === 'smart' ? 'SMART' : '—';
-    for(var si = 0; si < sessionLog.length; si++) {
-      var s = sessionLog[si];
-      if(logDateToISO(s.date) === filterDate && s.time === pt.time && (s.data||{}).inst === filterInst) {
-        if(s.data) s.data.autoBiasMode = modeLabel;
-        break;
+     oicPoints array so every entry gets the correct mode.
+     SKIP when abmdWasPreComputed: saveSnapshot already ran computeAutoBiasMode
+     on the live oicPoints array and set snap.data.autoBiasMode correctly.
+     renderOIChart rebuilds oicPoints from scratch (no biasMode on points),
+     so running the write-back here would overwrite every entry with '—'. ── */
+  if(!abmdWasPreComputed) {
+    oicPoints.forEach(function(pt) {
+      var modeLabel = pt.biasMode === 'raw' ? 'RAW' : pt.biasMode === 'smart' ? 'SMART' : '—';
+      for(var si = 0; si < sessionLog.length; si++) {
+        var s = sessionLog[si];
+        if(logDateToISO(s.date) === filterDate && s.time === pt.time && (s.data||{}).inst === filterInst) {
+          if(s.data) s.data.autoBiasMode = modeLabel;
+          break;
+        }
       }
-    }
-  });
-  /* Persist updated log */
-  try { localStorage.setItem(SESSION_KEY, JSON.stringify(sessionLog)); } catch(e) {}
+    });
+    /* Persist updated log */
+    try { localStorage.setItem(SESSION_KEY, JSON.stringify(sessionLog)); } catch(e) {}
+  }
   renderLogTable();
 
   /* ── Detect last crossover (raw) ── */
@@ -5378,83 +5408,34 @@ function updateVCTrendBadge(){
 }
 
 /* ═══════════════════════════════════════════════════════════════════
-   SMART AUTO-REFRESH  v4.0
+   WORKER-MODE: Browser is a pure Firestore reader.
    ─────────────────────────────────────────────────────────────────
-   TIMING FIX v4.0:
-   Old code: istMs = now.getTime() + 330*60000 - getTimezoneOffset()*60000
-   Bug: in IST browser, getTimezoneOffset() = -330, so formula added
-   660 minutes (11 hours) instead of 330. The sec counter was off by
-   hours, causing the sec=3..6 window to fire at the wrong second.
-   Fix: use Intl.DateTimeFormat to get the real IST second directly.
+   The Cloudflare Worker cron handles all Dhan API calls, computation,
+   and Firestore writes. The browser onSnapshot listener receives each
+   write and triggers all rendering automatically.
 
-   RETRY FIX v4.0:
-   fetchAll() catches all errors internally and never rejects its
-   Promise, so .catch() in startSmartAuto never fired.
-   Fix: fetchAll now returns a boolean (true=success, false=failed).
-   The scheduler checks the return value instead of .catch().
+   Browser never calls Dhan directly — zero duplicate snapshots,
+   zero bias conflicts, 50% fewer Dhan API calls, 50% fewer writes.
 
-   RETRY LOGIC v4.0:
-   On failure, retry after 3s. Each subsequent retry also fires 3s
-   apart. On the next natural minute boundary, the normal fetch fires
-   regardless (smartLastMinute resets correctly).
-   Retries stop automatically when the next minute's normal fetch fires.
-
-   OHLC SKIP THRESHOLD v4.0:
-   Reduced from 90s to 55s so OHLC is always fetched once per minute
-   (every 60s cycle minus 5s buffer). Previously at 90s it could skip
-   OHLC on two consecutive fast manual fetches.
+   The ⚡ Fetch Now button calls /trigger on the worker, which makes
+   the worker run its full pipeline immediately (useful after an
+   instrument switch, or to get a snapshot mid-minute without waiting).
+   This costs exactly the same as one cron tick — no extra writes if
+   the worker's dedup guard catches a same-time doc.
 ═══════════════════════════════════════════════════════════════════ */
+
+/* Stubs — kept so any legacy call sites don't throw ReferenceErrors */
 var smartAutoEnabled  = false;
 var smartAutoTimer    = null;
-var smartLastMinute   = -1;
-var smartRetryTimer   = null;
-var smartRetryCount   = 0;   /* how many retries fired this minute */
-var eodSnapshotFired  = false;
-var eodFiredDate      = '';
+function startSmartAuto(){ log('⏱ Worker-mode: browser auto-fetch disabled (worker handles all fetching)', 'ok'); }
+function stopSmartAuto(){  log('⏱ Worker-mode: stopSmartAuto() called (no-op)', 'ok'); }
+function toggleAuto(){}
+function doAutoFetch(){}
+function scheduleRetry(){}
 
-/* ── Screen Wake Lock — best-effort mitigation against background-tab
-   timer throttling. Supported on Chrome/Edge/Android (incl. when the tab
-   is merely backgrounded, not just screen-off); NOT supported on Firefox
-   or Safari/iOS (no API at all there — silently no-ops, which is fine,
-   the catch-up fetch below covers those browsers instead).
-   Does NOT guarantee every single 1-min candle is captured while hidden
-   on every platform — no client-side web API can promise that (see
-   visibilitychange catch-up below for the safety net on top of this). */
-var wakeLock = null;
-async function acquireWakeLock(){
-  if(!('wakeLock' in navigator)) return;
-  try{
-    wakeLock = await navigator.wakeLock.request('screen');
-    log('🔒 Wake Lock acquired — helps keep auto-refresh alive while tab is backgrounded', 'ok');
-    wakeLock.addEventListener('release', function(){
-      log('🔓 Wake Lock released (system/browser revoked it)', 'warn');
-      wakeLock = null;
-    });
-  }catch(e){
-    log('Wake Lock request failed: ' + e.message, 'warn');
-  }
-}
-function releaseWakeLock(){
-  if(wakeLock){ try{ wakeLock.release(); }catch(e){} wakeLock = null; }
-}
-/* Re-acquire on visibility return (the lock auto-releases when tab is
-   hidden on some platforms) AND fire an immediate catch-up fetch in case
-   a candle closed while we were away — this is the real safety net,
-   since Wake Lock support is partial across browsers. */
-document.addEventListener('visibilitychange', function(){
-  if(!document.hidden){
-    if(smartAutoTimer && !wakeLock) acquireWakeLock();
-    if(smartAutoTimer && isMarketOpen() && tok() && cid() && !isFetching){
-      log('⏱ Tab visible again — firing catch-up fetch in case a candle was missed', 'ok');
-      doAutoFetch(false);
-    }
-  }
-});
-
-/* ── Correct IST second/minute using Intl — works regardless of browser TZ ── */
+/* ── Correct IST second/minute using Intl — kept for isMarketOpen() and other callers ── */
 function getISTTime() {
   var now = new Date();
-  /* Intl gives us the real wall-clock time in Asia/Kolkata */
   var parts = {};
   new Intl.DateTimeFormat('en-US', {
     timeZone: 'Asia/Kolkata',
@@ -5468,113 +5449,45 @@ function getISTTime() {
   };
 }
 
-function startSmartAuto(){
-  if(smartAutoTimer) return;
-  smartLastMinute = -1;
-  smartRetryCount = 0;
-  /* Reset EOD flag for new day */
-  var todayStr = new Date().toLocaleDateString('en-IN',{timeZone:'Asia/Kolkata',year:'numeric',month:'2-digit',day:'2-digit'});
-  if(eodFiredDate !== todayStr) { eodSnapshotFired = false; eodFiredDate = todayStr; }
+/* ── triggerWorkerNow — hits /trigger on the Cloudflare Worker ──
+   Makes the worker run its full fetch → compute → Firestore write
+   pipeline immediately, without waiting for the next cron tick.
+   The result arrives via onSnapshot within ~3-5 seconds.
+   Safe to call any time — the worker's same-time dedup guard
+   prevents a duplicate doc if the cron just fired. */
+var _triggerCooldown = false;
 
-  /* Tick every 250ms for tighter second-boundary detection */
-  acquireWakeLock();
-
-  smartAutoTimer = setInterval(function(){
-    if(!isMarketOpen()){ setLiveBadge('closed'); return; }
-    if(!tok() || !cid()) return;
-
-    var ist = getISTTime();
-    var sec = ist.seconds;
-    var min = ist.totalMins;
-
-    /* ── Fire window: sec=2..5 (2s buffer after candle close, 4s catch window) ──
-       Candle closes at sec=0. Dhan propagates data within ~1-2s.
-       Firing at sec=2 gives 2s buffer. Window closes at sec=5 (4s wide).
-       At 250ms tick rate we'll hit this window reliably.
-       min !== smartLastMinute prevents double-fire within same minute.    */
-    if(sec >= 2 && sec <= 5 && min !== smartLastMinute){
-      smartLastMinute = min;
-      smartRetryCount = 0;
-      if(smartRetryTimer){ clearTimeout(smartRetryTimer); smartRetryTimer = null; }
-
-      var isEODMinute = (min === 15*60+30);
-      if(isEODMinute && eodSnapshotFired) {
-        log('⏱ Auto: EOD already fired today — skipping duplicate', 'warn');
-        return;
-      }
-
-      if(!isFetching){
-        log('⏱ Auto: firing min=' + min + ' sec=' + sec + (isEODMinute?' [EOD]':''), 'ok');
-        doAutoFetch(isEODMinute);
-      }
-    }
-  }, 250);
-  log('⏱ Smart auto-refresh STARTED v4.0 — sec=2..5 window, Intl IST clock, 250ms tick', 'ok');
-}
-
-/* ── Separated fetch + retry into own function for clean recursion ── */
-function doAutoFetch(isEODMinute) {
-  fetchAll(isEODMinute ? 'eod' : 'live').then(function(ok){
-    if(ok === false) {
-      /* fetchAll returned false = internal error, schedule retry */
-      scheduleRetry(isEODMinute);
-    } else if(isEODMinute) {
-      eodSnapshotFired = true;
-      var tod = new Date().toLocaleDateString('en-IN',{timeZone:'Asia/Kolkata',year:'numeric',month:'2-digit',day:'2-digit'});
-      eodFiredDate = tod;
-      log('⏱ EOD snapshot saved for ' + tod, 'ok');
-    }
-  }).catch(function(e){
-    log('⏱ Auto fetch error (unhandled): ' + e.message, 'err');
-    scheduleRetry(isEODMinute);
-  });
-}
-
-function scheduleRetry(isEODMinute) {
-  smartRetryCount++;
-  if(smartRetryCount > 5) {
-    log('⏱ Auto retry limit (5) reached this minute — waiting for next candle', 'warn');
+function triggerWorkerNow() {
+  if(_triggerCooldown){
+    log('⚡ Trigger: cooldown active (10s) — worker already running', 'warn');
     return;
   }
-  /* Retry after 3s. The next minute's natural fetch will also fire at sec=2..5
-     regardless of retry state (smartLastMinute controls that independently). */
-  if(smartRetryTimer) clearTimeout(smartRetryTimer);
-  smartRetryTimer = setTimeout(function(){
-    smartRetryTimer = null;
-    /* Check if a new minute started — if so, let normal tick handle it */
-    var nowMin = getISTTime().totalMins;
-    if(nowMin !== smartLastMinute) {
-      log('⏱ Retry skipped — new minute arrived, normal tick will handle it', 'ok');
-      return;
-    }
-    if(!isFetching && tok() && cid()){
-      log('⏱ Retry #' + smartRetryCount + ' firing for min=' + smartLastMinute, 'warn');
-      doAutoFetch(isEODMinute);
-    }
-  }, 3000);
-  log('⏱ Retry #' + smartRetryCount + ' scheduled in 3s', 'warn');
-}
+  _triggerCooldown = true;
+  setTimeout(function(){ _triggerCooldown = false; }, 10000);
 
-function stopSmartAuto(){
-  if(smartAutoTimer){ clearInterval(smartAutoTimer); smartAutoTimer=null; }
-  if(smartRetryTimer){ clearTimeout(smartRetryTimer); smartRetryTimer=null; }
-  smartLastMinute = -1;
-  smartRetryCount = 0;
-  releaseWakeLock();
-  log('⏱ Smart auto-refresh STOPPED', 'ok');
-}
+  var btn = document.getElementById('fetch_btn');
+  if(btn){ btn.disabled = true; btn.textContent = '⏳ Fetching…'; }
+  log('⚡ Trigger: asking worker to fetch now…', 'ok');
 
-function toggleAuto(){
-  isAutoOn=document.getElementById('auto_toggle').checked;
-  var st=document.getElementById('auto_status');
-  if(isAutoOn){
-    st.textContent='On — 1-min sync';st.style.color='var(--teal)';
-    startSmartAuto();
-  } else {
-    st.textContent='Off';st.style.color='var(--text3)';
-    stopSmartAuto();
-    if(autoTimer){ clearInterval(autoTimer); autoTimer=null; }
-  }
+  fetch(PROXY + '/trigger', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' }
+  })
+  .then(function(r){ return r.json(); })
+  .then(function(d){
+    if(d && d.ok){
+      log('⚡ Trigger: worker accepted — snapshot will arrive via onSnapshot in ~3-5s', 'ok');
+    } else {
+      log('⚡ Trigger: worker returned unexpected response: ' + JSON.stringify(d), 'warn');
+    }
+  })
+  .catch(function(e){
+    log('⚡ Trigger: request failed — ' + e.message, 'err');
+    _triggerCooldown = false;
+  })
+  .finally(function(){
+    if(btn){ btn.disabled = false; btn.textContent = '⚡ Fetch Now'; }
+  });
 }
 
 /* ═══════════════════════════════════════════════════════════
@@ -5865,7 +5778,7 @@ window.onload=function(){
     <!-- chips cloned by JS -->
   </div>
   <div class="mob-actions">
-    <button class="icon-btn" onclick="fetchAll()" title="Refresh" style="flex-shrink:0;">&#8635;</button>
+    <button class="icon-btn" onclick="triggerWorkerNow()" title="Refresh" style="flex-shrink:0;">&#8635;</button>
     <button class="icon-btn" id="theme_btn_mob" onclick="toggleTheme()" title="Toggle theme" style="flex-shrink:0;">🌙</button>
     <button class="icon-btn" onclick="ocDoSignOut()" style="flex-shrink:0;" title="Sign out"
       onmouseover="this.style.background='rgba(240,69,69,0.1)'"
