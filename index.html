@@ -1406,9 +1406,9 @@ function ocLoadFromFirebase() {
       window._ocLoadSnapshots().then(function(rows) {
         sessionLog = rows || [];
         if(loadEl) loadEl.style.display = 'none';
+        log('Firebase: loaded ' + sessionLog.length + ' snapshots', 'ok');
         stampAllABMD();
         renderLogTable(); updateHistoryDropdown(); renderOIChart(); renderVegaChart();
-        log('Firebase: loaded ' + sessionLog.length + ' snapshots', 'ok');
       }).catch(function(e){
         if(loadEl) loadEl.style.display = 'none';
         log('Firebase load error: ' + e.message, 'err');
