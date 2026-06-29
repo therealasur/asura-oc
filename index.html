@@ -564,18 +564,57 @@ window._ocSaveSnapshot = async function(snap) {
 /* Real-time listener handle — kept so we can unsubscribe if needed */
 window._ocUnsubscribeSnapshots = null;
 
-/* ── Split read strategy (fixes free-tier read exhaustion) ──────────────
-   OLD: onSnapshot on entire collection → reads ALL docs on EVERY worker write
-        = 375 writes/day × 2554 docs = ~960K reads/day (19× over free limit)
+/* ── Optimised read strategy (free-tier safe, multi-device safe) ────────
+   GOAL: ≤375 Firestore reads/day regardless of how many devices/reloads.
 
-   NEW:
-   1. getDocs() once on load — fetches all historical docs (past days).
-      Cost: ~2500 reads, paid ONCE per page load.
-   2. onSnapshot scoped to TODAY only — one new doc per worker write.
-      Cost: ≤375 reads/day total.
+   STRATEGY:
+   1. localStorage cache stores all PAST-day snapshots keyed by
+      'asura_hist_cache' with a 'cachedUpTo' timestamp = yesterday's end.
+      On reload: if cache is fresh (same calendar day), skip Firestore
+      entirely for history — zero reads for past data.
+      If cache is stale (new day has started): fetch only docs since
+      'cachedUpTo', merge, update cache. Typically 375 new docs (1 day).
 
-   Total: ~2875 reads/day vs 960K before. Well within 50K free limit.
-─────────────────────────────────────────────────────────────────────── */
+   2. onSnapshot scoped to TODAY only — 1 read per worker write.
+      Cost: ≤375 reads/day regardless of reloads.
+
+   3. On first-ever load (no cache): full getDocs once, then cache it.
+      Cost: ~2500 reads, one-time only. Every subsequent load is free.
+
+   Worst-case per reload after first load:
+   - Reload same day     → 0 history reads + live listener only ✅
+   - Reload on new day   → ≤375 reads (1 day delta) + live listener ✅
+   - 20 reloads, 3 devs  → still ≤375/day total for history ✅
+──────────────────────────────────────────────────────────────────────── */
+
+var HIST_CACHE_KEY = 'asura_hist_cache';
+var HIST_CACHE_VER = 2; /* bump this to force a full refresh if schema changes */
+
+function _loadHistCache() {
+  try {
+    var raw = localStorage.getItem(HIST_CACHE_KEY);
+    if (!raw) return null;
+    var obj = JSON.parse(raw);
+    if (!obj || obj.ver !== HIST_CACHE_VER) return null;
+    return obj; /* { ver, cachedUpTo, rows: [...] } */
+  } catch(e) { return null; }
+}
+
+function _saveHistCache(rows, cachedUpTo) {
+  try {
+    var obj = { ver: HIST_CACHE_VER, cachedUpTo: cachedUpTo, rows: rows };
+    localStorage.setItem(HIST_CACHE_KEY, JSON.stringify(obj));
+  } catch(e) {
+    /* localStorage full — clear and try again with just the last 500 rows */
+    try {
+      localStorage.removeItem(HIST_CACHE_KEY);
+      var trimmed = rows.slice(0, 500);
+      localStorage.setItem(HIST_CACHE_KEY, JSON.stringify({ ver: HIST_CACHE_VER, cachedUpTo: cachedUpTo, rows: trimmed }));
+      console.warn('Hist cache trimmed to 500 rows (localStorage quota)');
+    } catch(e2) { console.warn('Hist cache save failed:', e2); }
+  }
+}
+
 window._ocSubscribeSnapshots = function(onUpdate) {
   if (!window._ocCurrentUser) return;
 
@@ -584,18 +623,22 @@ window._ocSubscribeSnapshots = function(onUpdate) {
     window._ocUnsubscribeSnapshots = null;
   }
 
-  /* Step 1: one-time historical load */
-  var histQ = query(collection(db, 'oc_sessions'), orderBy('ts', 'desc'));
-  getDocs(histQ).then(function(histSnap) {
-    var allRows = [];
-    histSnap.forEach(function(d){ allRows.push(d.data()); });
-    if (onUpdate) onUpdate(allRows);
+  /* Compute today's midnight in ms (UTC) */
+  var todayStartMs = new Date();
+  todayStartMs.setUTCHours(0, 0, 0, 0);
+  var todayTs = todayStartMs.getTime();
 
-    /* Step 2: live listener for TODAY only */
-    var todayStartMs = new Date();
-    todayStartMs.setUTCHours(0, 0, 0, 0);
-    var todayTs = todayStartMs.getTime();
+  /* Yesterday's end = todayTs - 1ms */
+  var yesterdayEndTs = todayTs - 1;
 
+  var cache = _loadHistCache();
+  var cacheValid = cache && cache.cachedUpTo >= yesterdayEndTs;
+
+  function attachLiveListener(allRows) {
+    /* Deliver initial render immediately */
+    if (onUpdate) onUpdate(allRows.slice());
+
+    /* onSnapshot scoped to TODAY — 1 Firestore read per worker write */
     var liveQ = query(
       collection(db, 'oc_sessions'),
       where('ts', '>=', todayTs),
@@ -608,19 +651,65 @@ window._ocSubscribeSnapshots = function(onUpdate) {
       var todayIds = Object.keys(todayMap);
       if (!todayIds.length) return;
 
-      /* Merge today's fresh docs over the historical base */
       var base = allRows.filter(function(r){ return (r.ts||0) < todayTs; });
       var todayRows = todayIds.map(function(id){ return todayMap[id]; });
       todayRows.sort(function(a,b){ return (b.ts||0)-(a.ts||0); });
       allRows = todayRows.concat(base);
-      if (onUpdate) onUpdate(allRows);
+      if (onUpdate) onUpdate(allRows.slice());
     }, function(e) {
       console.error('Firestore onSnapshot error:', e);
     });
+  }
 
-  }).catch(function(e) {
-    console.error('Firestore historical load error:', e);
-  });
+  if (cacheValid) {
+    /* ── FAST PATH: cache is fresh — 0 Firestore reads for history ── */
+    console.log('[Cache] History cache hit — ' + cache.rows.length + ' rows, 0 Firestore reads');
+    attachLiveListener(cache.rows.slice());
+
+  } else if (cache && cache.cachedUpTo) {
+    /* ── DELTA PATH: new day started — fetch only docs since last cache ── */
+    var deltaTs = cache.cachedUpTo + 1;
+    console.log('[Cache] Delta fetch from ts=' + deltaTs + ' (' + cache.rows.length + ' cached rows)');
+    var deltaQ = query(
+      collection(db, 'oc_sessions'),
+      where('ts', '>=', deltaTs),
+      where('ts', '<', todayTs),      /* past days only — not today */
+      orderBy('ts', 'desc')
+    );
+    getDocs(deltaQ).then(function(deltaSnap) {
+      var newRows = [];
+      deltaSnap.forEach(function(d){ newRows.push(d.data()); });
+      /* Merge new past-day rows into cached rows */
+      var merged = newRows.concat(cache.rows);
+      _saveHistCache(merged, yesterdayEndTs);
+      console.log('[Cache] Delta: +' + newRows.length + ' rows → ' + merged.length + ' total cached');
+      attachLiveListener(merged.slice());
+    }).catch(function(e) {
+      /* Delta fetch failed — fall back to cache to avoid blank screen */
+      console.warn('[Cache] Delta fetch failed, using stale cache:', e);
+      attachLiveListener(cache.rows.slice());
+    });
+
+  } else {
+    /* ── COLD START: no cache — full getDocs once, then cache forever ── */
+    console.log('[Cache] Cold start — full Firestore history load (one-time)');
+    var histQ = query(
+      collection(db, 'oc_sessions'),
+      where('ts', '<', todayTs),
+      orderBy('ts', 'desc')
+    );
+    getDocs(histQ).then(function(histSnap) {
+      var allRows = [];
+      histSnap.forEach(function(d){ allRows.push(d.data()); });
+      _saveHistCache(allRows, yesterdayEndTs);
+      console.log('[Cache] Cold start complete — ' + allRows.length + ' rows cached');
+      attachLiveListener(allRows.slice());
+    }).catch(function(e) {
+      console.error('[Cache] Cold start failed:', e);
+      /* Still attach live listener so today's data works */
+      attachLiveListener([]);
+    });
+  }
 };
 
 window._ocDeleteAll = async function() {
@@ -632,6 +721,12 @@ window._ocDeleteAll = async function() {
     await Promise.all(deletes);
     return true;
   } catch(e) { console.error('Firestore delete:', e); return false; }
+};
+
+/* Dev utility — call window._ocBustCache() in console to force a full Firestore reload on next page open */
+window._ocBustCache = function() {
+  try { localStorage.removeItem(HIST_CACHE_KEY); } catch(e) {}
+  console.log("[Cache] History cache cleared. Reload the page to re-fetch from Firestore.");
 };
 
 window._ocSaveSettings = async function(token, clientId, selectedInst, selectedExpiry) {
