@@ -1698,6 +1698,89 @@ function stampAllABMD() {
   }
 }
 
+/* ── Worker-mode bias normalization ──
+   The Cloudflare Worker cron always writes overallBias === overallBiasRaw
+   (both the RAW/uninverted direction) because the cron has no idea which
+   browser/user is looking at it or whether their Smart Money Mode toggle
+   is on. Every other part of this dashboard (Session Logger table, OI/Vega
+   chart bias coloring, view-snapshot modal, bias-change alerts) reads
+   d.overallBias expecting it to already be the user's CURRENT display bias
+   (post-inversion) — exactly what processAndRender() writes when the
+   browser does its own fetching (overallBias:applyBiasInversion(bias.dir)).
+   Reproduce that same invariant here, once, right after every Firestore
+   read, so every downstream consumer "just works" without needing its own
+   inversion logic. */
+function normalizeSessionLogBias(){
+  if(!sessionLog || !sessionLog.length) return;
+  for(var i=0;i<sessionLog.length;i++){
+    var d = sessionLog[i].data;
+    if(!d) continue;
+    var raw = d.overallBiasRaw || d._rawBias || d.overallBias || '—';
+    d.overallBiasRaw = raw;
+    d.overallBias = (typeof applyBiasInversion==='function') ? applyBiasInversion(raw) : raw;
+  }
+}
+
+/* ── Worker-mode hero render ──
+   In worker-mode the browser never calls processAndRender() (that only runs
+   on a manual fetchAll), so main_content/empty_state and the Bias Hero /
+   Signal Cards / S-R / Spot Bar / Flow panels were never populated from the
+   snapshots the worker writes — leaving the dashboard stuck on "Enter
+   credentials above…" even with live data flowing into the Session Logger.
+   This paints those panels straight from the latest Firestore snapshot for
+   the given instrument. Note: Firestore only stores summary fields (not the
+   full per-strike option chain), so S-R / Spot Bar fall back to a single
+   nearest strike each (via nearestRes/nearestSup) instead of the 5-deep
+   ladder a live fetch builds, and bias "reasons" text isn't available
+   (worker deletes _rawBiasObj before writing) — both safe, clearly-scoped
+   degradations rather than silently wrong data. */
+function renderHeroFromSnapshot(inst){
+  var latest = null;
+  for(var i=0;i<sessionLog.length;i++){
+    if((sessionLog[i].data||{}).inst === inst){ latest = sessionLog[i]; break; }
+  }
+  if(!latest || !latest.data) return false;
+  var d = latest.data;
+  var cfg = INSTRUMENTS[inst];
+  if(!cfg || d.spot==null) return false;
+
+  var biasObj = {
+    dir:     d.overallBiasRaw || d._rawBias || d.overallBias || '—',
+    score:   parseFloat(d.biasScore) || 0,
+    reasons: []
+  };
+
+  try {
+    document.getElementById('main_content').style.display='block';
+    document.getElementById('empty_state').style.display='none';
+    document.getElementById('bias_inst_label').textContent=cfg.label;
+    document.getElementById('bias_expiry_label').textContent=fmtExpiry(d.expiry)+' expiry';
+    document.getElementById('sr_spot_badge').textContent='SPOT '+parseFloat(d.spot).toFixed(1);
+
+    renderStep('biasHero', function(){renderBiasHero(biasObj, d.atmPCR, d.netCeChg, d.netPeChg, d.atmRatio, d.greeksDivergence);});
+    renderStep('signals', function(){renderSignalCards(d.maxPain, d.totalPCR, d.ivSkew, d.ceNearBuild, d.peNearBuild, d.atmRatio, cfg, d.gammaWall, d.spot, d.atmVega, d.atmTheta);});
+
+    var resistances = d.nearestRes!=null ? [{strike:d.nearestRes, ceOI:d.nearestResOI}] : [];
+    var supports     = d.nearestSup!=null ? [{strike:d.nearestSup, peOI:d.nearestSupOI}] : [];
+    renderStep('sr', function(){renderSR(resistances, supports, d.spot, d.atm, d.nearestResOI, d.nearestSupOI, d.deltaValidatedRes, d.deltaResStatus, d.deltaResDelta, d.deltaValidatedSup, d.deltaSupStatus, d.deltaSupDelta);});
+    renderStep('spotBar', function(){renderSpotBar(d.spot, resistances, supports);});
+    renderStep('flow', function(){renderFlowSection(d.netCeChg, d.netPeChg, []);});
+  } catch(heroErr) {
+    log('renderHeroFromSnapshot failed: '+heroErr.message, 'err');
+    return false;
+  }
+
+  /* Keep lastRenderedData in sync (already-inverted overallBias from
+     normalizeSessionLogBias) so checkBiasChangeAlert / invert-toggle
+     re-render see a consistent picture. */
+  lastRenderedData[inst] = Object.assign({}, d, {
+    overallBiasRaw: biasObj.dir,
+    _rawBias: biasObj.dir,
+    _rawBiasObj: biasObj
+  });
+  return true;
+}
+
 function ocLoadFromFirebase() {
   var loadEl = document.getElementById('fb_loading_status');
   if(loadEl) loadEl.style.display = 'block';
@@ -1706,6 +1789,7 @@ function ocLoadFromFirebase() {
     if(window._ocSubscribeSnapshots) {
       window._ocSubscribeSnapshots(function(rows) {
         sessionLog = rows || [];
+        normalizeSessionLogBias();
         if(loadEl) loadEl.style.display = 'none';
         if(firstLoad) {
           firstLoad = false;
@@ -1723,7 +1807,14 @@ function ocLoadFromFirebase() {
           (_settingsPromise || Promise.resolve()).then(function() {
             renderOIChart(); renderVegaChart();
             stampAllABMD();
-            /* Worker-mode: browser is a pure Firestore reader — no auto-fetch needed */
+            renderHeroFromSnapshot(currentInst);
+            /* Worker-mode: browser is a pure Firestore reader — no auto-fetch needed,
+               but the Expiry dropdown still needs REAL dates from Dhan's expirylist
+               API, not the synthetic Thursday-increment fallback populateExpiry()
+               uses before any data exists. fetchAll() (which normally fetches the
+               real list) never runs in worker-mode, so do it here once settings
+               (token/clientId) have loaded. */
+            refreshExpiryList(currentInst);
           });
         } else {
           /* ── Worker-mode live update: new snapshot arrived via onSnapshot ──
@@ -1748,6 +1839,7 @@ function ocLoadFromFirebase() {
           renderLogTable(); updateHistoryDropdown();
           renderOIChart(); renderVegaChart();
           stampAllABMD();
+          renderHeroFromSnapshot(currentInst);
 
           /* Fire bias change signal alert — reads from sessionLog directly
              because lastRenderedData is only populated by fetchAll (manual).
@@ -1851,36 +1943,28 @@ function toggleInvertBias(){
   badge.classList.toggle('visible', isInvertBias);
   try { localStorage.setItem('asura_oc_invert', isInvertBias ? '1' : '0'); } catch(e){}
   log('Smart Money Mode (Invert Bias): '+(isInvertBias?'ON':'OFF'), isInvertBias?'warn':'ok');
-  /* Re-render bias hero instantly so inversion is reflected without a new fetch.
-     In worker-mode the worker deletes _rawBiasObj before writing to Firestore
-     (it's an internal computation object, not a stored field). So when the
-     dashboard receives a snapshot via onSnapshot, _rawBiasObj is absent.
-     Fix: reconstruct a minimal bias-like object from the stored scalar fields
-     (overallBiasRaw, biasScore, overallBias) so renderBiasHero always fires. */
-  if(lastFetchTime && lastRenderedData[currentInst]) {
+
+  /* Re-derive the display bias for every cached snapshot and repaint
+     everything that reads d.overallBias — Session Logger table, OI/Vega
+     chart bias coloring, and the Bias Hero cards — so the toggle takes
+     effect everywhere instantly, not just on the hero cards. */
+  normalizeSessionLogBias();
+  renderLogTable();
+  renderOIChart();
+  renderVegaChart();
+  if(!renderHeroFromSnapshot(currentInst) && lastFetchTime && lastRenderedData[currentInst]) {
+    /* Fallback for the rare case sessionLog has no entry yet but a manual
+       fetchAll() already populated lastRenderedData this session. */
     var _d = lastRenderedData[currentInst];
-    var _biasObj = _d._rawBiasObj;
-    /* Reconstruct from stored fields if _rawBiasObj was stripped (worker-mode) */
-    if(!_biasObj && (_d.overallBiasRaw || _d._rawBias || _d.overallBias)) {
-      _biasObj = {
-        dir:     _d.overallBiasRaw || _d._rawBias || _d.overallBias || '—',
-        score:   parseFloat(_d.biasScore) || 0,
-        reasons: []  /* reasons not stored — empty array is safe for display */
-      };
-    }
-    if(_biasObj) {
-      try {
-        renderBiasHero(
-          _biasObj,
-          _d.atmPCR,
-          _d.netCeChg,
-          _d.netPeChg,
-          _d.atmRatio,
-          _d.greeksDivergence
-        );
-      } catch(reRenderErr) {
-        log('Re-render bias on invert toggle failed: '+reRenderErr.message, 'warn');
-      }
+    var _biasObj = _d._rawBiasObj || {
+      dir:     _d.overallBiasRaw || _d._rawBias || _d.overallBias || '—',
+      score:   parseFloat(_d.biasScore) || 0,
+      reasons: []
+    };
+    try {
+      renderBiasHero(_biasObj, _d.atmPCR, _d.netCeChg, _d.netPeChg, _d.atmRatio, _d.greeksDivergence);
+    } catch(reRenderErr) {
+      log('Re-render bias on invert toggle failed: '+reRenderErr.message, 'warn');
     }
   }
 }
@@ -2315,7 +2399,9 @@ function setInst(inst){
   /* Reset chart view so new instrument gets a clean fit-all render */
   oicNeverDrawn = true;
   populateExpiry(inst);
+  refreshExpiryList(inst); /* replace synthetic fallback with real Dhan dates once available */
   renderOIChart(); /* refresh chart for new instrument */
+  renderHeroFromSnapshot(inst); /* paint from cached snapshot instantly, before worker re-fetches */
   /* Worker-mode: triggerWorkerFetch below handles fetching new instrument data */
   /* Persist selected instrument + its now-default expiry to Firestore so the
      worker knows which to process, then trigger an immediate cron run so the
@@ -2328,6 +2414,28 @@ function setInst(inst){
     window._ocSaveSettings(tok, cid, inst, expiry);
   }
   triggerWorkerFetch('instrument switch → ' + inst);
+}
+
+/* ── Fetch the REAL expiry list independent of fetchAll() ──
+   fetchAll() (which normally calls fetchExpiryList) never runs in pure
+   worker/listener mode — the browser just reads Firestore snapshots and
+   never hits the Dhan API itself. That left populateExpiry() permanently
+   stuck on its synthetic "every N days from today" fallback, which doesn't
+   match NSE's actual (sometimes irregular / holiday-shifted) expiry
+   calendar. This makes the same lightweight expirylist call fetchAll()
+   would have made, independently, whenever credentials are available —
+   on initial load and whenever the instrument is switched. Safe to call
+   even if credentials aren't ready yet (no-ops via the tok()/cid() guard
+   inside fetchExpiryList's underlying fetch — caught and logged, never
+   throws upward). */
+async function refreshExpiryList(inst){
+  if(!tok()||!cid()) return;
+  try{
+    var expiries = await fetchExpiryList(inst);
+    if(expiries && expiries.length) populateExpiry(inst);
+  }catch(e){
+    log('Expiry list refresh failed: '+e.message,'warn');
+  }
 }
 
 function populateExpiry(inst){
