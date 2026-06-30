@@ -670,25 +670,118 @@ function _saveHistCache(rows, cachedUpTo) {
   }
 }
 
-window._ocSubscribeSnapshots = function(onUpdate) {
+/* ── Market-hours read gate ─────────────────────────────────────────────
+   Outside 09:15–15:30 IST the dashboard serves everything from the local
+   localStorage cache — zero Firestore reads regardless of how many tabs
+   or devices are open.  During market hours the normal live onSnapshot
+   listener runs as before (1 read per worker write).
+
+   EOD seal: when the first onSnapshot tick lands at/after 15:30 IST the
+   listener merges today's rows into the cache, updates cachedUpTo to
+   today's end-of-day timestamp, and unsubscribes.  All subsequent opens
+   (any tab, any device) get the full dataset from cache.
+
+   Auto re-open: a setTimeout fires exactly at 09:15:05 IST the following
+   morning and re-calls _ocSubscribeSnapshots so the live listener
+   reattaches without any manual action.
+
+   Manual override: triggerWorkerNow() / the ↺ refresh chip always forces
+   a re-subscribe regardless of time, so you can pull data on demand even
+   outside market hours if you ever need to.
+   ──────────────────────────────────────────────────────────────────────── */
+
+/* Shared handle so the auto-reopen timer can be cleared on manual re-subscribe */
+window._ocMarketOpenTimer = null;
+
+/* Helper — current IST minutes since midnight (works before getIST() is defined
+   because this module script runs before the main script block) */
+function _istMinutesNow() {
+  var now = new Date();
+  var fmt = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Kolkata',
+    hour: '2-digit', minute: '2-digit', hour12: false
+  });
+  var p = {}; fmt.formatToParts(now).forEach(function(x){ p[x.type] = parseInt(x.value, 10); });
+  return p.hour * 60 + p.minute;
+}
+
+/* Schedule auto-reopen at 09:15:05 IST the next morning */
+function _scheduleMarketOpenReattach(onUpdate) {
+  if (window._ocMarketOpenTimer) { clearTimeout(window._ocMarketOpenTimer); window._ocMarketOpenTimer = null; }
+  var now = new Date();
+  /* Build a Date for 09:15:05 IST today */
+  var istFmt = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Kolkata',
+    year: 'numeric', month: '2-digit', day: '2-digit' });
+  var p = {}; istFmt.formatToParts(now).forEach(function(x){ p[x.type] = x.value; });
+  var todayIST = p.year + '-' + p.month + '-' + p.day;
+  var targetMs = new Date(todayIST + 'T09:15:05+05:30').getTime();
+  /* If 09:15:05 has already passed today, schedule for tomorrow */
+  if (targetMs <= Date.now()) targetMs += 24 * 60 * 60 * 1000;
+  var msUntil = targetMs - Date.now();
+  console.log('[Cache] Market-hours gate: listener OFF. Auto-reopen in ' + Math.round(msUntil/60000) + ' min (at 09:15:05 IST)');
+  window._ocMarketOpenTimer = setTimeout(function() {
+    console.log('[Cache] 09:15:05 IST — reattaching live Firestore listener');
+    window._ocSubscribeSnapshots(onUpdate, true /* forced */);
+  }, msUntil);
+}
+
+window._ocSubscribeSnapshots = function(onUpdate, forced) {
   if (!window._ocCurrentUser) return;
+
+  /* Cancel any pending auto-reopen timer — we're re-subscribing now */
+  if (window._ocMarketOpenTimer) { clearTimeout(window._ocMarketOpenTimer); window._ocMarketOpenTimer = null; }
 
   if (window._ocUnsubscribeSnapshots) {
     window._ocUnsubscribeSnapshots();
     window._ocUnsubscribeSnapshots = null;
   }
 
-  /* Compute today's midnight in IST (UTC+05:30) — NOT UTC midnight.
-     UTC midnight = 05:30 IST, so using setUTCHours(0) would make the
-     live listener boundary wrong between 00:00–05:30 IST.              */
+  /* Compute today's midnight in IST (UTC+05:30) — NOT UTC midnight. */
   var _istNow = getIST ? getIST() : (function(){ var n=new Date(); var fmt=new Intl.DateTimeFormat('en-CA',{timeZone:'Asia/Kolkata',year:'numeric',month:'2-digit',day:'2-digit'}); var p={}; fmt.formatToParts(n).forEach(function(x){p[x.type]=x.value;}); return {isoDate:p.year+'-'+p.month+'-'+p.day}; })();
   var todayTs = new Date(_istNow.isoDate + 'T00:00:00+05:30').getTime();
-
-  /* Yesterday's end = todayTs - 1ms */
+  var todayEndTs = new Date(_istNow.isoDate + 'T23:59:59+05:30').getTime();
   var yesterdayEndTs = todayTs - 1;
+
+  var OPEN_MIN  = 9 * 60 + 15;  /* 09:15 */
+  var CLOSE_MIN = 15 * 60 + 30; /* 15:30 */
+  var nowMin = _istMinutesNow();
+  var isMarketWindow = (nowMin >= OPEN_MIN && nowMin <= CLOSE_MIN);
 
   var cache = _loadHistCache();
   var cacheValid = cache && cache.cachedUpTo >= yesterdayEndTs;
+
+  /* ── OFF-HOURS PATH (before 09:15 or after 15:30) ───────────────────
+     If cache already covers today (cachedUpTo >= todayEndTs) or covers
+     at least yesterday AND we're before market open, serve from cache
+     with zero Firestore reads and schedule auto-reopen.               */
+  if (!forced && !isMarketWindow) {
+    var todayCached = cache && cache.cachedUpTo >= todayEndTs;
+    var histCached  = cache && cache.cachedUpTo >= yesterdayEndTs;
+    if (todayCached || histCached) {
+      console.log('[Cache] Off-hours gate — serving ' + cache.rows.length + ' rows from cache, 0 Firestore reads');
+      if (onUpdate) onUpdate(cache.rows.slice());
+      _scheduleMarketOpenReattach(onUpdate);
+      return;
+    }
+    /* No usable cache yet (very first cold start) — fall through to
+       Firestore so the user isn't left with a blank dashboard. */
+    console.log('[Cache] Off-hours but no cache yet — doing one-time cold start');
+  }
+
+  /* ── EOD SEAL helper ─────────────────────────────────────────────────
+     Called inside the live onSnapshot callback when the first tick at/
+     after 15:30 lands.  Merges today's rows into the cache, seals it
+     with cachedUpTo = todayEndTs, and unsubscribes.                   */
+  function sealEODAndStop(allRows) {
+    console.log('[Cache] EOD seal — merging ' + allRows.length + ' rows into cache and unsubscribing');
+    _saveHistCache(allRows, todayEndTs);
+    if (window._ocUnsubscribeSnapshots) {
+      window._ocUnsubscribeSnapshots();
+      window._ocUnsubscribeSnapshots = null;
+    }
+    /* Schedule re-open for tomorrow 09:15 */
+    _scheduleMarketOpenReattach(onUpdate);
+  }
 
   function attachLiveListener(allRows) {
     /* Deliver initial render immediately */
@@ -701,19 +794,12 @@ window._ocSubscribeSnapshots = function(onUpdate) {
       orderBy('ts', 'desc')
     );
 
+    var _eodSealed = false; /* guard: only seal once */
+
     window._ocUnsubscribeSnapshots = onSnapshot(liveQ, function(liveSnap) {
       var todayMap = {};
       liveSnap.forEach(function(d){ todayMap[d.id] = d.data(); });
       var todayIds = Object.keys(todayMap);
-      /* NOTE: do NOT early-return when todayIds is empty.
-         Firestore fires an initial onSnapshot call synchronously with 0 docs
-         when the query matches nothing yet (first snapshot of a new trading day
-         before the worker has written anything). If we return early here, the
-         historical allRows that were already delivered via onUpdate(allRows) in
-         attachLiveListener never get merged with today's rows on subsequent
-         ticks — but more importantly the first empty fire must not clobber the
-         allRows reference. We simply skip the merge-and-update when empty,
-         preserving the previously-delivered state.                              */
       if (!todayIds.length) return;
 
       var base = allRows.filter(function(r){ return (r.ts||0) < todayTs; });
@@ -721,6 +807,13 @@ window._ocSubscribeSnapshots = function(onUpdate) {
       todayRows.sort(function(a,b){ return (b.ts||0)-(a.ts||0); });
       allRows = todayRows.concat(base);
       if (onUpdate) onUpdate(allRows.slice());
+
+      /* EOD seal: if current IST time is at/after 15:30 and we haven't
+         sealed yet, merge+cache+unsubscribe */
+      if (!_eodSealed && _istMinutesNow() >= CLOSE_MIN) {
+        _eodSealed = true;
+        sealEODAndStop(allRows);
+      }
     }, function(e) {
       console.error('Firestore onSnapshot error:', e);
     });
@@ -744,13 +837,11 @@ window._ocSubscribeSnapshots = function(onUpdate) {
     getDocs(deltaQ).then(function(deltaSnap) {
       var newRows = [];
       deltaSnap.forEach(function(d){ newRows.push(d.data()); });
-      /* Merge new past-day rows into cached rows */
       var merged = newRows.concat(cache.rows);
       _saveHistCache(merged, yesterdayEndTs);
       console.log('[Cache] Delta: +' + newRows.length + ' rows → ' + merged.length + ' total cached');
       attachLiveListener(merged.slice());
     }).catch(function(e) {
-      /* Delta fetch failed — fall back to cache to avoid blank screen */
       console.warn('[Cache] Delta fetch failed, using stale cache:', e);
       attachLiveListener(cache.rows.slice());
     });
@@ -771,7 +862,6 @@ window._ocSubscribeSnapshots = function(onUpdate) {
       attachLiveListener(allRows.slice());
     }).catch(function(e) {
       console.error('[Cache] Cold start failed:', e);
-      /* Still attach live listener so today's data works */
       attachLiveListener([]);
     });
   }
@@ -1410,6 +1500,12 @@ function _doTriggerWorker(reason, showSpinner) {
   _triggerCooldown = true;
   setTimeout(function(){ _triggerCooldown = false; }, 10000);
 
+  /* Manual press always force-reattaches the Firestore listener, bypassing
+     the market-hours gate — so Fetch Now / ↺ chip always work on demand. */
+  if (reason === 'manual' && window._ocSubscribeSnapshots && window._ocLoadFromFirebase_onUpdate) {
+    window._ocSubscribeSnapshots(window._ocLoadFromFirebase_onUpdate, true /* forced */);
+  }
+
   var btn = document.getElementById('fetch_btn');
   if(showSpinner && btn){ btn.disabled = true; btn.textContent = '⏳ Fetching…'; }
   log('⚡ Trigger: asking worker to fetch now… (' + reason + ')', 'ok');
@@ -1809,7 +1905,10 @@ function ocLoadFromFirebase() {
   var firstLoad = true;
   function trySubscribe() {
     if(window._ocSubscribeSnapshots) {
-      window._ocSubscribeSnapshots(function(rows) {
+      /* Expose the onUpdate callback globally so triggerWorkerNow can
+         force a re-subscribe (bypassing the market-hours gate) without
+         losing the original handler reference. */
+      var _onUpdate = function(rows) {
         sessionLog = rows || [];
         normalizeSessionLogBias();
         if(loadEl) loadEl.style.display = 'none';
@@ -1890,7 +1989,9 @@ function ocLoadFromFirebase() {
             checkBiasChangeAlert();
           }
         }
-      });
+      };
+      window._ocLoadFromFirebase_onUpdate = _onUpdate;
+      window._ocSubscribeSnapshots(_onUpdate);
     } else {
       setTimeout(trySubscribe, 300);
     }
