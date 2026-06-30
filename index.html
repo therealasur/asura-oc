@@ -278,8 +278,8 @@ body.light .picker-input{color-scheme:light;}
 
 /* Log table */
 .logger-table-wrap{max-height:240px;overflow-y:auto;border-radius:var(--radius-sm);border:1px solid var(--border);}
-.logger-table{width:100%;border-collapse:collapse;font-size:11px;min-width:940px;}
-.logger-table th{position:sticky;top:0;background:var(--bg4);color:var(--text3);font-weight:600;font-size:9px;text-transform:uppercase;letter-spacing:0.5px;padding:7px 10px;text-align:left;border-bottom:1px solid var(--border2);z-index:1;white-space:nowrap;}
+.logger-table{width:100%;border-collapse:separate;border-spacing:0;font-size:11px;min-width:940px;}
+.logger-table th{position:sticky;top:0;background:var(--bg4);color:var(--text3);font-weight:600;font-size:9px;text-transform:uppercase;letter-spacing:0.5px;padding:6px 10px 14px;text-align:left;border-bottom:1px solid var(--border2);z-index:2;white-space:nowrap;height:32px;box-sizing:border-box;vertical-align:top;}
 .logger-table td{padding:7px 10px;border-bottom:1px solid var(--border);color:var(--text2);vertical-align:middle;white-space:nowrap;}
 .logger-table tr:last-child td{border-bottom:none;}
 .logger-table tr:hover td{background:var(--bg4);}
@@ -290,9 +290,9 @@ body.light .picker-input{color-scheme:light;}
 .follow-bias::after{content:'\2713 FOLLOW';font-size:7px;font-weight:700;letter-spacing:0.3px;color:var(--gold);display:block;line-height:1;margin-top:2px;}
 .follow-mixed{display:block;font-size:7px;font-weight:700;letter-spacing:0.3px;color:var(--orange);margin-top:2px;}
 .follow-header{box-shadow:inset 0 0 0 1.5px var(--gold)!important;background:var(--gold-bg)!important;color:var(--gold)!important;position:relative;}
-.follow-header::after{content:'\2713 FOLLOW NOW';display:block;font-size:7px;font-weight:700;letter-spacing:0.3px;color:var(--gold);margin-top:2px;}
-.follow-header-mixed{box-shadow:inset 0 0 0 1.5px var(--orange)!important;background:var(--orange-bg)!important;}
-.follow-header-mixed::after{content:'\26A0 MIXED · WAIT';display:block;font-size:7px;font-weight:700;letter-spacing:0.3px;color:var(--orange);margin-top:2px;}
+.follow-header::after{content:'\2713 FOLLOW NOW';position:absolute;left:10px;bottom:2px;font-size:7px;font-weight:700;letter-spacing:0.3px;color:var(--gold);white-space:nowrap;pointer-events:none;}
+.follow-header-mixed{box-shadow:inset 0 0 0 1.5px var(--orange)!important;background:var(--orange-bg)!important;position:relative;}
+.follow-header-mixed::after{content:'\26A0 MIXED \00B7 WAIT';position:absolute;left:10px;bottom:2px;font-size:7px;font-weight:700;letter-spacing:0.3px;color:var(--orange);white-space:nowrap;pointer-events:none;}
 .logger-empty{padding:30px;text-align:center;color:var(--text3);font-size:12px;}
 
 /* ── MISC ── */
