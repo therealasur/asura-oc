@@ -1733,6 +1733,13 @@ function normalizeSessionLogBias(){
     var raw = d.overallBiasRaw || d._rawBias || d.overallBias || '—';
     d.overallBiasRaw = raw;
     d.overallBias = (typeof applyBiasInversion==='function') ? applyBiasInversion(raw) : raw;
+    /* Defensive normalization: docs written by a pre-followBias-field worker
+       deploy have NO followBias key at all (genuinely `undefined`, not
+       `null`). Every renderer already treats undefined===null, but coalesce
+       it here too so sessionLog never carries a bare `undefined` in memory —
+       keeps console/debug inspection honest and removes any chance a future
+       consumer forgets the `|| null` guard. */
+    if(d.followBias === undefined) d.followBias = null;
   }
 }
 
