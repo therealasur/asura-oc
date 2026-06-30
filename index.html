@@ -555,7 +555,26 @@ window._ocSendOtpLink = function(email) {
 window._ocSaveSnapshot = async function(snap) {
   if (!window._ocCurrentUser) return false;
   try {
-    var docId = (snap.date||'').replace(/[^a-zA-Z0-9]/g,'-') + '_' + (snap.time||'').replace(/[^0-9]/g,'-') + '_' + (snap.data&&snap.data.inst||'x');
+    /* Normalize snap.time to total minutes-since-midnight before building the
+       docId — NOT raw digit-stripping. Old browser-saved snaps used 12h
+       en-IN format ("1:25:30 pm"); current snaps use 24h ("13:25:30").
+       Stripping non-digits from those two strings produces DIFFERENT docIds
+       for what could be the same trading minute (the dropped "pm"/"am"
+       changes nothing positionally, but a 12h hour without am/pm context
+       is ambiguous), so the same minute could be written as two separate
+       Firestore documents instead of upserting one. Mirrors the same
+       am/pm-aware parsing as the global timeToMinutes() (defined later in
+       a separate non-module script and not reachable from here). */
+    var _tStr = (snap.time||'').trim().toLowerCase();
+    var _isPM = _tStr.indexOf('pm') !== -1;
+    var _isAM = _tStr.indexOf('am') !== -1;
+    var _tDigits = _tStr.replace(/[apm\s]/g,'');
+    var _tParts = _tDigits.split(':');
+    var _h = parseInt(_tParts[0]||0,10), _m = parseInt(_tParts[1]||0,10), _sec = parseInt(_tParts[2]||0,10);
+    if(_isPM && _h < 12) _h += 12;
+    if(_isAM && _h === 12) _h = 0;
+    var _timeKey = String(_h).padStart(2,'0') + String(_m).padStart(2,'0') + String(_sec||0).padStart(2,'0');
+    var docId = (snap.date||'').replace(/[^a-zA-Z0-9]/g,'-') + '_' + _timeKey + '_' + (snap.data&&snap.data.inst||'x');
     await setDoc(doc(db, 'oc_sessions', docId), snap);
     return true;
   } catch(e) { console.error('Firestore save:', e); return false; }
@@ -623,10 +642,11 @@ window._ocSubscribeSnapshots = function(onUpdate) {
     window._ocUnsubscribeSnapshots = null;
   }
 
-  /* Compute today's midnight in ms (UTC) */
-  var todayStartMs = new Date();
-  todayStartMs.setUTCHours(0, 0, 0, 0);
-  var todayTs = todayStartMs.getTime();
+  /* Compute today's midnight in IST (UTC+05:30) — NOT UTC midnight.
+     UTC midnight = 05:30 IST, so using setUTCHours(0) would make the
+     live listener boundary wrong between 00:00–05:30 IST.              */
+  var _istNow = getIST ? getIST() : (function(){ var n=new Date(); var fmt=new Intl.DateTimeFormat('en-CA',{timeZone:'Asia/Kolkata',year:'numeric',month:'2-digit',day:'2-digit'}); var p={}; fmt.formatToParts(n).forEach(function(x){p[x.type]=x.value;}); return {isoDate:p.year+'-'+p.month+'-'+p.day}; })();
+  var todayTs = new Date(_istNow.isoDate + 'T00:00:00+05:30').getTime();
 
   /* Yesterday's end = todayTs - 1ms */
   var yesterdayEndTs = todayTs - 1;
@@ -649,6 +669,15 @@ window._ocSubscribeSnapshots = function(onUpdate) {
       var todayMap = {};
       liveSnap.forEach(function(d){ todayMap[d.id] = d.data(); });
       var todayIds = Object.keys(todayMap);
+      /* NOTE: do NOT early-return when todayIds is empty.
+         Firestore fires an initial onSnapshot call synchronously with 0 docs
+         when the query matches nothing yet (first snapshot of a new trading day
+         before the worker has written anything). If we return early here, the
+         historical allRows that were already delivered via onUpdate(allRows) in
+         attachLiveListener never get merged with today's rows on subsequent
+         ticks — but more importantly the first empty fire must not clobber the
+         allRows reference. We simply skip the merge-and-update when empty,
+         preserving the previously-delivered state.                              */
       if (!todayIds.length) return;
 
       var base = allRows.filter(function(r){ return (r.ts||0) < todayTs; });
@@ -1030,7 +1059,7 @@ console.log('OC Firebase Auth ready');
         <span id="vc_invert_badge" style="display:none;padding:1px 5px;border-radius:6px;font-size:8px;font-weight:700;background:var(--orange-bg);border:1px solid var(--orange-border);color:var(--orange);">ON</span>
       </div>
       <!-- Live bias readout -->
-      <div id="vc_live_bias" style="display:none;margin-left:auto;display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+      <div id="vc_live_bias" style="display:none;margin-left:auto;align-items:center;gap:10px;flex-wrap:wrap;">
         <div style="font-size:11px;color:var(--text2);">CE Vega: <span id="vc_ce_live" style="font-weight:700;font-family:'JetBrains Mono',monospace;color:var(--green);">—</span></div>
         <div style="font-size:11px;color:var(--text2);">PE Vega: <span id="vc_pe_live" style="font-weight:700;font-family:'JetBrains Mono',monospace;color:var(--red);">—</span></div>
         <div style="font-size:11px;color:var(--text2);">Diff: <span id="vc_diff_live" style="font-weight:700;font-family:'JetBrains Mono',monospace;">—</span></div>
@@ -1323,25 +1352,65 @@ console.log('OC Firebase Auth ready');
 
 var PROXY = 'https://dhan-proxy.asurthedropouttrader.workers.dev';
 
-/* Fire-and-forget: tells the worker to run its cron pipeline immediately
-   instead of waiting for the next 1-min tick. Called after instrument or
-   expiry switches so the dashboard gets fresh data within a few seconds.
-   No UI blocking, no spinner, no awaited response — failures are silently
-   logged since the next natural cron tick is a built-in fallback. */
+/* ── Unified worker trigger — shared cooldown + debounce ──────────────────
+   BOTH triggerWorkerFetch (background, after inst/expiry switch) and
+   triggerWorkerNow (button press) share one 10-second cooldown so that
+   pressing Fetch Now immediately after switching instruments does not
+   fire two concurrent worker pipeline runs and produce duplicate snapshots.
+
+   triggerWorkerFetch    → debounced 2s (collapses rapid inst+expiry changes),
+                           then calls _doTriggerWorker (if cooldown allows).
+   triggerWorkerNow      → calls _doTriggerWorker immediately (button press).
+   _doTriggerWorker      → the single function that actually hits /trigger.
+──────────────────────────────────────────────────────────────────────────── */
+var _triggerCooldown        = false;  /* shared cooldown flag */
+var _triggerWorkerFetchTimer = null;  /* debounce timer for background triggers */
+
+function _doTriggerWorker(reason, showSpinner) {
+  if(_triggerCooldown){
+    log('⚡ Trigger (' + reason + '): cooldown active (10s) — skipped', 'warn');
+    return;
+  }
+  _triggerCooldown = true;
+  setTimeout(function(){ _triggerCooldown = false; }, 10000);
+
+  var btn = document.getElementById('fetch_btn');
+  if(showSpinner && btn){ btn.disabled = true; btn.textContent = '⏳ Fetching…'; }
+  log('⚡ Trigger: asking worker to fetch now… (' + reason + ')', 'ok');
+
+  fetch(PROXY + '/trigger', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })
+    .then(function(r){ return r.json(); })
+    .then(function(d){
+      if(d && d.ok){
+        log('⚡ Trigger: worker accepted — snapshot will arrive via onSnapshot in ~3-5s', 'ok');
+      } else {
+        log('⚡ Trigger: worker returned unexpected response: ' + JSON.stringify(d), 'warn');
+      }
+    })
+    .catch(function(e){
+      log('⚡ Trigger: request failed — ' + e.message, 'err');
+      _triggerCooldown = false; /* allow retry on network error */
+    })
+    .finally(function(){
+      if(showSpinner && btn){ btn.disabled = false; btn.textContent = '⚡ Fetch Now'; }
+    });
+}
+
+/* Background trigger — debounced 2s, no spinner, logs silently */
 function triggerWorkerFetch(reason){
-  try{
-    fetch(PROXY + '/trigger', { method: 'POST' })
-      .then(function(r){ log('Trigger (' + reason + '): ' + (r.ok ? 'OK' : 'HTTP ' + r.status), r.ok ? 'ok' : 'warn'); })
-      .catch(function(e){ log('Trigger (' + reason + ') failed: ' + e.message, 'warn'); });
-  }catch(e){ /* fetch not available — ignore, cron will catch up within 1 min */ }
+  if(_triggerWorkerFetchTimer) clearTimeout(_triggerWorkerFetchTimer);
+  _triggerWorkerFetchTimer = setTimeout(function(){
+    _triggerWorkerFetchTimer = null;
+    _doTriggerWorker(reason, false);
+  }, 2000);
 }
 
 var CID_KEY = 'asura_oc_cid';
 var TOKEN_KEY = 'asura_oc_token';
 var SESSION_KEY = 'asura_oc_session_v1';
-var WARN_THRESHOLD = 80;
 var currentInst = 'nifty';
 var autoTimer = null;
+var _ocSettingsTimer = null;  /* hoisted: shared across ocInitApp calls (re-auth) */
 var isAutoOn = true;  /* always-on — toggle removed from UI */
 var lastFetchTime = null;
 var vixGlobal = null;
@@ -1350,7 +1419,6 @@ var lastExpirFetch = {};   /* timestamp of last expiry fetch per inst */
 var expiryCache = {};
 var manualExpiry = false;
 var sessionLog = [];
-var storageWarningDismissed = false; /* kept as stub — no longer used */
 var _fbSaveTimer = null;
 var lastRenderedData = {};
 /* ── Invert bias state ── */
@@ -1360,7 +1428,9 @@ var isInvertBias = false;
 var debugLines = [];
 var isDebugOn = false;
 function log(msg, level){
-  var ts = new Date().toLocaleTimeString('en-IN');
+  /* timeZone + hour12:false pinned so debug timestamps stay in IST and 24h
+     format on any device, matching the 24h snapshot times for correlation. */
+  var ts = new Date().toLocaleTimeString('en-IN',{timeZone:'Asia/Kolkata',hour12:false});
   var cls = level==='err'?'debug-line-err':level==='warn'?'debug-line-warn':level==='ok'?'debug-line-ok':'';
   debugLines.push({ts:ts, msg:msg, cls:cls});
   if(debugLines.length > 400) debugLines.shift();
@@ -1368,6 +1438,7 @@ function log(msg, level){
 }
 function renderDebugBox(){
   var el = document.getElementById('debug_box'); if(!el) return;
+  if(!isDebugOn) return; /* skip DOM work when panel is hidden */
   el.innerHTML = debugLines.map(function(l){
     return '<div class="'+l.cls+'">'+l.ts+' — '+escapeHTML(l.msg)+'</div>';
   }).join('');
@@ -1426,13 +1497,15 @@ function ocLockBack() {
 }
 function ocTryUnlock() {
   var email = (document.getElementById('oc_lock_email').value||'').trim();
-  var pass  = (document.getElementById('oc_lock_pass').value||'').trim();
+  var pass  = (document.getElementById('oc_lock_pass').value||'');
   var err   = document.getElementById('oc_lock_err');
   var btn   = document.getElementById('oc_lock_btn');
   if(!email || !pass) { err.textContent = 'Enter email and password.'; return; }
   btn.disabled = true;
   btn.textContent = 'Signing in…';
   err.textContent = '';
+  var _ocUnlockWaitMs = 0;
+  var OC_FIREBASE_WAIT_TIMEOUT_MS = 10000; /* give up waiting for the Firebase module after 10s */
   function trySignIn() {
     if(window._ocSignIn) {
       window._ocSignIn(email, pass).then(function(res) {
@@ -1444,7 +1517,12 @@ function ocTryUnlock() {
         }
         /* Success: onAuthStateChanged in Firebase module handles the rest */
       });
+    } else if(_ocUnlockWaitMs >= OC_FIREBASE_WAIT_TIMEOUT_MS) {
+      btn.disabled = false;
+      btn.textContent = 'Sign In';
+      err.textContent = 'Could not load sign-in service. Check your connection and reload the page.';
     } else {
+      _ocUnlockWaitMs += 300;
       setTimeout(trySignIn, 300);
     }
   }
@@ -1454,8 +1532,10 @@ function ocSendOtpLink() {
   var email = (document.getElementById('oc_lock_email').value || '').trim();
   var err = document.getElementById('oc_lock_err');
   var btn = document.getElementById('oc_lock_otp_btn');
-  if (!email) { err.textContent = 'Email is required.'; return; }
+  if (!email || !email.includes('@')) { err.textContent = 'Enter a valid email address.'; return; }
   btn.disabled = true; btn.textContent = 'Sending…'; err.textContent = '';
+  var _ocOtpWaitMs = 0;
+  var OC_FIREBASE_WAIT_TIMEOUT_MS_OTP = 10000; /* give up waiting for the Firebase module after 10s */
   function doSend() {
     if (window._ocSendOtpLink) {
       window._ocSendOtpLink(email).then(function(res) {
@@ -1467,7 +1547,13 @@ function ocSendOtpLink() {
           err.textContent = res.msg || 'Failed to send link.';
         }
       });
-    } else { setTimeout(doSend, 300); }
+    } else if (_ocOtpWaitMs >= OC_FIREBASE_WAIT_TIMEOUT_MS_OTP) {
+      btn.disabled = false; btn.textContent = '📧 Send Sign-In Link';
+      err.textContent = 'Could not load sign-in service. Check your connection and reload the page.';
+    } else {
+      _ocOtpWaitMs += 300;
+      setTimeout(doSend, 300);
+    }
   }
   doSend();
 }
@@ -1511,7 +1597,6 @@ function ocInitApp() {
     }
     triggerWorkerFetch('expiry change → ' + ((document.getElementById('expiry_sel')||{}).value||''));
   });
-  var _ocSettingsTimer = null;
   function onCredChange(){
     renderOIChart(); renderVegaChart();
     clearTimeout(_ocSettingsTimer);
@@ -1554,8 +1639,11 @@ function stampAllABMD() {
           ce: (d.netCeChg||0) / 100000,
           pe: (d.netPeChg||0) / 100000,
           spot: d.spot, atm: d.atm,
-          bias: d.overallBias || '---',
-          rawBias: d.overallBiasRaw || d.overallBias || '---',
+          bias: d.overallBias || '—',
+          /* _rawBias fallback: legacy snapshots saved before overallBiasRaw
+             existed still carry _rawBias — without this, ABMD reads the
+             possibly-inverted display bias for rawType/colour decisions. */
+          rawBias: d.overallBiasRaw || d._rawBias || d.overallBias || '—',
           netPeChgRaw: (d.netPeChg||0),
           netCeChgRaw: (d.netCeChg||0),
           candleHigh: d.candleHigh != null ? parseFloat(d.candleHigh) : null,
@@ -1594,22 +1682,70 @@ function ocLoadFromFirebase() {
           firstLoad = false;
           log('Firebase: loaded ' + sessionLog.length + ' snapshots (real-time listener active)', 'ok');
           renderLogTable(); updateHistoryDropdown();
-          /* Defer chart render + ABMD stamp by 150ms so _ocLoadSettings
-             has time to populate Dhan token/clientId inputs before
-             renderOIChart() checks isLoggedIn(). Without this defer,
-             isLoggedIn() returns false on first load, renderOIChart exits
-             early, the autoBiasMode write-back never runs, and all pills
-             remain showing '—' in the session log table.              */
-          setTimeout(function() {
+          /* Wait for _ocLoadSettings (async Firestore read) to populate
+             Dhan token/clientId inputs before renderOIChart() checks
+             isLoggedIn(). Using a Promise chain instead of a hardcoded
+             150ms setTimeout — on slow networks 150ms was insufficient,
+             causing isLoggedIn()=false, renderOIChart to exit early, and
+             all autoBiasMode pills to show '—' on first page load.      */
+          var _settingsPromise = (window._ocLoadSettings)
+            ? window._ocLoadSettings()
+            : Promise.resolve();
+          (_settingsPromise || Promise.resolve()).then(function() {
             renderOIChart(); renderVegaChart();
             stampAllABMD();
             /* Worker-mode: browser is a pure Firestore reader — no auto-fetch needed */
-          }, 150);
+          });
         } else {
+          /* ── Worker-mode live update: new snapshot arrived via onSnapshot ──
+             Fix all 4 bugs found in audit:
+             1. Live/outdated badge was never updated (only fetchAll set it)
+             2. updated_txt timestamp was never set (only fetchAll set it)
+             3. lastFetchTime was never set (outdated timer relied on it)
+             4. checkBiasChangeAlert read lastRenderedData (only fetchAll populates it)
+                → now reads directly from sessionLog[0] which IS populated by onSnapshot
+          ── */
           log('Firebase: snapshots updated (' + sessionLog.length + ' total)', 'ok');
+
+          /* Update "Updated HH:MM:SS" timestamp and live badge.
+             timeZone+hour12:false pinned so this stays IST/24h on any device. */
+          lastFetchTime = Date.now();
+          var updEl = document.getElementById('updated_txt');
+          if(updEl) updEl.textContent = 'Updated ' + new Date().toLocaleTimeString('en-IN',{timeZone:'Asia/Kolkata',hour12:false});
+          var updMob = document.getElementById('updated_txt_mob');
+          if(updMob) updMob.textContent = new Date().toLocaleTimeString('en-IN',{timeZone:'Asia/Kolkata',hour12:false});
+          if(typeof isMarketOpen === 'function') setLiveBadge(isMarketOpen() ? 'live' : 'closed');
+
           renderLogTable(); updateHistoryDropdown();
           renderOIChart(); renderVegaChart();
           stampAllABMD();
+
+          /* Fire bias change signal alert — reads from sessionLog directly
+             because lastRenderedData is only populated by fetchAll (manual).
+             Filter by currentInst so sensex/nifty switch doesn't cross-contaminate. */
+          if(typeof checkBiasChangeAlert === 'function') {
+            /* Inject the most-recent snapshot for the CURRENT instrument into
+               lastRenderedData so checkBiasChangeAlert can read it.
+               Filter by inst so switching between nifty/sensex never uses the
+               wrong instrument's bias for the alert comparison.              */
+            var _latest = null;
+            for(var _si = 0; _si < sessionLog.length; _si++) {
+              if((sessionLog[_si].data||{}).inst === currentInst) { _latest = sessionLog[_si]; break; }
+            }
+            if(_latest && _latest.data) {
+              var _d = _latest.data;
+              if(!lastRenderedData[currentInst]) lastRenderedData[currentInst] = {};
+              /* Only override bias fields — preserve any live processAndRender data */
+              /* _rawBias fallback: older worker snapshots pre-dating overallBiasRaw storage
+                 still carry _rawBias (before the key was deleted on save). Without this,
+                 checkBiasChangeAlert reads the display bias (possibly inverted), causing
+                 false alerts when Smart Money Mode is ON. */
+              lastRenderedData[currentInst].overallBiasRaw = _d.overallBiasRaw || _d._rawBias || _d.overallBias || '—';
+              lastRenderedData[currentInst]._rawBias       = _d.overallBiasRaw || _d._rawBias || _d.overallBias || '—';
+              lastRenderedData[currentInst].overallBias    = _d.overallBias    || '—';
+            }
+            checkBiasChangeAlert();
+          }
         }
       });
     } else {
@@ -1686,14 +1822,27 @@ function toggleInvertBias(){
   badge.classList.toggle('visible', isInvertBias);
   try { localStorage.setItem('asura_oc_invert', isInvertBias ? '1' : '0'); } catch(e){}
   log('Smart Money Mode (Invert Bias): '+(isInvertBias?'ON':'OFF'), isInvertBias?'warn':'ok');
-  /* Re-render if data is available */
-  /* Re-render bias hero using stored data so inversion applies instantly without a new fetch */
+  /* Re-render bias hero instantly so inversion is reflected without a new fetch.
+     In worker-mode the worker deletes _rawBiasObj before writing to Firestore
+     (it's an internal computation object, not a stored field). So when the
+     dashboard receives a snapshot via onSnapshot, _rawBiasObj is absent.
+     Fix: reconstruct a minimal bias-like object from the stored scalar fields
+     (overallBiasRaw, biasScore, overallBias) so renderBiasHero always fires. */
   if(lastFetchTime && lastRenderedData[currentInst]) {
     var _d = lastRenderedData[currentInst];
-    if(_d && _d._rawBiasObj) {
+    var _biasObj = _d._rawBiasObj;
+    /* Reconstruct from stored fields if _rawBiasObj was stripped (worker-mode) */
+    if(!_biasObj && (_d.overallBiasRaw || _d._rawBias || _d.overallBias)) {
+      _biasObj = {
+        dir:     _d.overallBiasRaw || _d._rawBias || _d.overallBias || '—',
+        score:   parseFloat(_d.biasScore) || 0,
+        reasons: []  /* reasons not stored — empty array is safe for display */
+      };
+    }
+    if(_biasObj) {
       try {
         renderBiasHero(
-          _d._rawBiasObj,
+          _biasObj,
           _d.atmPCR,
           _d.netCeChg,
           _d.netPeChg,
@@ -1963,7 +2112,7 @@ function getIST(){
   var now=new Date();
   var fmt=new Intl.DateTimeFormat('en-CA',{timeZone:'Asia/Kolkata',year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false});
   var p={};fmt.formatToParts(now).forEach(function(x){p[x.type]=parseInt(x.value,10);});
-  return{year:p.year,month:p.month,date:p.day,day:new Date(Date.UTC(p.year,p.month-1,p.day)).getUTCDay(),hours:p.hour,minutes:p.minute,isoDate:p.year+'-'+(p.month<10?'0':'')+p.month+'-'+(p.day<10?'0':'')+p.day};
+  return{year:p.year,month:p.month,date:p.day,day:new Date(Date.UTC(p.year,p.month-1,p.day)).getUTCDay(),hours:p.hour,minutes:p.minute,seconds:p.second,isoDate:p.year+'-'+(p.month<10?'0':'')+p.month+'-'+(p.day<10?'0':'')+p.day};
 }
 /* ═══════════════════════════════════════════════════════════════════
    MARKET STATUS  v4.0  — derived from live 1-min candle COUNT
@@ -2095,11 +2244,17 @@ function getUpcomingDays(targetDay,count){
   var diff=(targetDay-day+7)%7;
   var pastClose=ist.hours>15||(ist.hours===15&&ist.minutes>=30);
   if(diff===0&&pastClose)diff=7;
-  var results=[]; var base=new Date(ist.isoDate+'T00:00:00Z');
+  var results=[]; var base=new Date(ist.isoDate+'T00:00:00+05:30');
   for(var i=0;i<count;i++){var c=new Date(base);c.setUTCDate(base.getUTCDate()+diff+i*7);results.push(c.toISOString().split('T')[0]);}
   return results;
 }
-function fmtExpiry(d){var m=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];var dt=new Date(d+'T00:00:00');return dt.getDate()+' '+m[dt.getMonth()];}
+function fmtExpiry(d){
+  /* Use string split instead of new Date() to avoid local-timezone day-shift.
+     d is always 'YYYY-MM-DD'; parse directly so result is timezone-agnostic. */
+  var m=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  var parts=d.split('-'); /* ['YYYY','MM','DD'] */
+  return parseInt(parts[2],10)+' '+m[parseInt(parts[1],10)-1];
+}
 function logDateToISO(dStr){
   var months={Jan:'01',Feb:'02',Mar:'03',Apr:'04',May:'05',Jun:'06',Jul:'07',Aug:'08',Sep:'09',Oct:'10',Nov:'11',Dec:'12'};
   var p=dStr.trim().split(' '); if(p.length!==3)return null;
@@ -2175,7 +2330,7 @@ function setLoading(on){
   document.getElementById('spinner').style.display=on?'inline-block':'none';
   var btn=document.getElementById('fetch_btn');
   if(on){btn.disabled=true;btn.textContent='Fetching…';}
-  else{btn.disabled=false;btn.textContent='⚡ Fetch';}
+  else{btn.disabled=false;btn.textContent='⚡ Fetch Now';}
 }
 function showErr(msg){var el=document.getElementById('err_box');el.textContent=msg;el.style.display='block';}
 function clearErr(){document.getElementById('err_box').style.display='none';}
@@ -2284,7 +2439,7 @@ async function fetchExpiryList(inst){
       if(d?.status==='success'&&Array.isArray(d.data)&&d.data.length){
         var ist=getIST();var today=ist.isoDate;
         var pastClose=ist.hours>15||(ist.hours===15&&ist.minutes>=30);
-        var cutoff=pastClose?(function(){var t=new Date(today+'T00:00:00Z');t.setUTCDate(t.getUTCDate()+1);return t.toISOString().split('T')[0];})():today;
+        var cutoff=pastClose?(function(){var t=new Date(today+'T00:00:00+05:30');t.setUTCDate(t.getUTCDate()+1);return t.toISOString().split('T')[0];})():today;
         var filtered=d.data.filter(function(x){return x>=cutoff;}).slice(0,8);
         if(filtered.length){expiryCache[inst]=filtered;lastExpirFetch[inst]=now;log('Expiry list ✔ '+inst,'ok');return filtered;}
       }
@@ -2379,7 +2534,7 @@ async function fetchAll(snapType){
       setLoading(false);setLiveBadge('outdated'); return false;
     }
     lastFetchTime=Date.now();
-    document.getElementById('updated_txt').textContent='Updated '+new Date().toLocaleTimeString('en-IN');
+    document.getElementById('updated_txt').textContent='Updated '+new Date().toLocaleTimeString('en-IN',{timeZone:'Asia/Kolkata',hour12:false});
     setLiveBadge(isMarketOpen() ? 'live' : 'closed'); /* holiday/weekend: show closed not live */
     try{
       processAndRender(raw,currentInst,expiry);
@@ -2424,11 +2579,12 @@ function processAndRender(data, inst, expiry){
   if(!oc||typeof oc!=='object'){showErr('Option chain data missing.');return;}
 
   var strikes=[];
+  /* safeNum hoisted outside forEach — avoids repeated function declaration per iteration */
+  function safeNum(obj,keys){for(var key of keys){var v=obj[key];if(v!=null&&!isNaN(parseFloat(v)))return parseFloat(v);}return null;}
   Object.keys(oc).forEach(function(k){
     var strike=parseFloat(k); if(isNaN(strike))return;
     var ceObj=oc[k]?.ce||oc[k]?.CE||{};
     var peObj=oc[k]?.pe||oc[k]?.PE||{};
-    function safeNum(obj,keys){for(var key of keys){var v=obj[key];if(v!=null&&!isNaN(parseFloat(v)))return parseFloat(v);}return null;}
     var ceOI=safeNum(ceObj,['oi','open_interest']);
     var peOI=safeNum(peObj,['oi','open_interest']);
     var cePrevOI=safeNum(ceObj,['previous_oi']);
@@ -2467,8 +2623,8 @@ function processAndRender(data, inst, expiry){
   var end=Math.min(strikes.length-1,atmIdx+cfg.strikesEachSide);
   var visible=strikes.slice(start,end+1);
 
-  var maxCeOI=Math.max.apply(null,visible.map(function(s){return s.ceOI||0;}));
-  var maxPeOI=Math.max.apply(null,visible.map(function(s){return s.peOI||0;}));
+  var maxCeOI=visible.length?Math.max.apply(null,visible.map(function(s){return s.ceOI||0;})):0;
+  var maxPeOI=visible.length?Math.max.apply(null,visible.map(function(s){return s.peOI||0;})):0;
 
   var aboveStrikes=strikes.filter(function(s){return s.strike>spot&&s.ceOI>0;}).sort(function(a,b){return b.ceOI-a.ceOI;}).slice(0,5);
   var belowStrikes=strikes.filter(function(s){return s.strike<spot&&s.peOI>0;}).sort(function(a,b){return b.peOI-a.peOI;}).slice(0,5);
@@ -3003,12 +3159,6 @@ function renderFlowSection(netCeChg,netPeChg,reversals){
 function loadLog(){ /* replaced by ocLoadFromFirebase() — called from ocInitApp */ }
 function saveLog(){ /* no-op: each snapshot saved individually via ocSaveToFirebase() */ }
 function updateStorageBar(){ /* no-op: unlimited cloud storage */ }
-function showStorageWarning(){ /* no-op */ }
-function dismissStorageWarning(){ /* no-op */ }
-function exportAndDismiss(){ /* no-op */ }
-function autoExportAndClear(){ /* no-op */ }
-function getStorageUsedBytes(){ return 0; }
-function estimateRecordsRemaining(){ return 99999; }
 
 /* CSV headers — now includes Greeks columns */
 var CSV_HEADERS=[
@@ -3037,7 +3187,7 @@ function buildCSVRows(log){
       d.inst||'—',d.expiry||'—',fmtN(d.spot,1),fmtN(d.atm,0),
       d.overallBias||'—', /* displayed bias (may be inverted) */
       d.autoBiasMode||'—', /* auto bias mode: SMART MONEY or RAW BIAS */
-      d.overallBiasRaw||d.overallBias||'—', /* raw OI bias always */
+      d.overallBiasRaw||d._rawBias||d.overallBias||'—', /* raw OI bias always */
       fmtN(d.biasScore),
       fmtN(d.atmPCR,2),fmtN(d.totalPCR,2),
       fmtN(d.maxPain,0),fmtN(d.gammaWall,0),
@@ -3115,7 +3265,7 @@ function saveSnapshot(type){
         spot: d.spot,
         atm:  d.atm,
         bias: d.overallBias || '—',
-        rawBias: d.overallBiasRaw || d.overallBias || '—',
+        rawBias: d.overallBiasRaw || d._rawBias || d.overallBias || '—',
         pcr: d.atmPCR != null ? parseFloat(d.atmPCR) : null,
         netPeChgRaw: (d.netPeChg||0),
         netCeChgRaw: (d.netCeChg||0),
@@ -3126,7 +3276,10 @@ function saveSnapshot(type){
 
       /* Only append if this time isn't already the last point (dedup guard) */
       var lastExisting = oicPoints[oicPoints.length - 1];
-      if(lastExisting.time !== newPt.time) {
+      /* Use timeToMinutes() for dedup — string equality fails when the last
+         oicPoint was saved in 12h format ("1:25:30 pm") and the new snap is
+         24h ("13:25:30"), causing a false non-duplicate and a double-append. */
+      if(timeToMinutes(lastExisting.time) !== timeToMinutes(newPt.time)) {
         oicPoints.push(newPt);
         log('saveSnapshot: appended new point to oicPoints (now ' + oicPoints.length + ' pts)', 'ok');
       } else {
@@ -3164,7 +3317,7 @@ function saveSnapshot(type){
         var sd = s.data;
         return { time: s.time, date: s.date, ce: (sd.netCeChg||0)/100000, pe: (sd.netPeChg||0)/100000,
                  spot: sd.spot, atm: sd.atm, bias: sd.overallBias||'—',
-                 rawBias: sd.overallBiasRaw||sd.overallBias||'—',
+                 rawBias: sd.overallBiasRaw||sd._rawBias||sd.overallBias||'—',
                  netPeChgRaw: (sd.netPeChg||0), netCeChgRaw: (sd.netCeChg||0),
                  candleHigh: sd.candleHigh != null ? parseFloat(sd.candleHigh) : null,
                  candleLow:  sd.candleLow  != null ? parseFloat(sd.candleLow)  : null };
@@ -3173,7 +3326,7 @@ function saveSnapshot(type){
         time: snap.time, date: snap.date,
         ce: (d.netCeChg||0)/100000, pe: (d.netPeChg||0)/100000,
         spot: d.spot, atm: d.atm, bias: d.overallBias||'—',
-        rawBias: d.overallBiasRaw||d.overallBias||'—',
+        rawBias: d.overallBiasRaw||d._rawBias||d.overallBias||'—',
         netPeChgRaw: (d.netPeChg||0), netCeChgRaw: (d.netCeChg||0),
         candleHigh: snap.data.candleHigh != null ? parseFloat(snap.data.candleHigh) : null,
         candleLow:  snap.data.candleLow  != null ? parseFloat(snap.data.candleLow)  : null
@@ -3205,13 +3358,9 @@ function saveSnapshot(type){
       atmBadge.textContent = 'ATM: ' + d.atm + '  ·  ' + (d.inst||'').toUpperCase();
     }
   } catch(e) {}
-  var rem=estimateRecordsRemaining();
-  if(rem<=0){
-    showStorageWarning(0,true);
-    autoExportAndClear();
-  }else if(rem<=WARN_THRESHOLD&&!storageWarningDismissed){
-    showStorageWarning(rem,false);
-  }
+  /* Storage-warning subsystem retired — Firestore is now the sole store for
+     session data (unlimited cloud storage), so localStorage quota no longer
+     applies here. See loadLog/saveLog/updateStorageBar stubs below. */
   log('Snapshot saved ('+type+') [ABM: '+snapAutoBiasMode+'] — '+sessionLog.length+' total','ok');
 }
 
@@ -3224,7 +3373,7 @@ function renderLogTable(){
     var d=s.data||{};var tr=document.createElement('tr');if(s.type==='eod')tr.className='eod-row';
     var typeHtml=s.type==='eod'?'<span style="color:var(--gold);">EOD</span><span class="eod-tag">3:30PM</span>':'<span style="color:var(--teal);">Live</span>';
     var displayBias=d.overallBias||'—';
-    var rawBias=d.overallBiasRaw||displayBias;
+    var rawBias=d.overallBiasRaw||d._rawBias||displayBias;
     var autoBiasMode=d.autoBiasMode||'—';
     var biasColor=displayBias?(displayBias.includes('BULL')?'var(--green)':displayBias.includes('BEAR')?'var(--red)':'var(--text2)'):'var(--text2)';
     var rawColor=rawBias?(rawBias.includes('BULL')?'var(--green)':rawBias.includes('BEAR')?'var(--red)':'var(--text2)'):'var(--text2)';
@@ -3314,7 +3463,7 @@ function viewSnapshot(){
       table+='<td style="padding:7px 10px;border-bottom:1px solid var(--border);font-family:monospace;">'+(d.spot!=null?parseFloat(d.spot).toFixed(1):'—')+'</td>';
       table+='<td style="padding:7px 10px;border-bottom:1px solid var(--border);font-family:monospace;">'+(d.atm||'—')+'</td>';
       table+='<td style="padding:7px 10px;border-bottom:1px solid var(--border);font-weight:700;color:'+biasColor+';">'+(d.overallBias||'—')+'</td>';
-      table+='<td style="padding:7px 10px;border-bottom:1px solid var(--border);font-size:10px;">'+(d.overallBiasRaw||d.overallBias||'—')+'</td>';
+      table+='<td style="padding:7px 10px;border-bottom:1px solid var(--border);font-size:10px;">'+(d.overallBiasRaw||d._rawBias||d.overallBias||'—')+'</td>';
       table+='<td style="padding:7px 10px;border-bottom:1px solid var(--border);font-family:monospace;">'+(d.biasScore||'—')+'</td>';
       table+='<td style="padding:7px 10px;border-bottom:1px solid var(--border);font-family:monospace;">'+(d.atmPCR!=null?parseFloat(d.atmPCR).toFixed(2):'—')+'</td>';
       table+='<td style="padding:7px 10px;border-bottom:1px solid var(--border);font-family:monospace;">'+(d.maxPain||'—')+'</td>';
@@ -3343,7 +3492,7 @@ function viewSnapshot(){
     {label:'Spot', val:d.spot!=null?parseFloat(d.spot).toFixed(1):null},
     {label:'ATM Strike', val:d.atm},
     {label:'Overall Bias (display)', val:d.overallBias, color:biasColor},
-    {label:'Raw OI Bias', val:d.overallBiasRaw||d.overallBias},
+    {label:'Raw OI Bias', val:d.overallBiasRaw||d._rawBias||d.overallBias},
     {label:'Bias Score', val:d.biasScore},
     {label:'ATM PCR', val:d.atmPCR!=null?parseFloat(d.atmPCR).toFixed(2):null},
     {label:'Total PCR', val:d.totalPCR!=null?parseFloat(d.totalPCR).toFixed(2):null},
@@ -3633,7 +3782,7 @@ function renderOIChart() {
       spot: d.spot,
       atm: d.atm,
       bias: d.overallBias || '—',
-      rawBias: d.overallBiasRaw || d.overallBias || '—',
+      rawBias: d.overallBiasRaw || d._rawBias || d.overallBias || '—',
       pcr: d.atmPCR != null ? parseFloat(d.atmPCR) : null,
       deltaSup: d.deltaSupStatus || '—',
       deltaSupVal: d.deltaSupDelta != null ? parseFloat(d.deltaSupDelta) : null,
@@ -3648,11 +3797,12 @@ function renderOIChart() {
     };
   });
 
-  /* Patch the LAST point (most recent) with live ohlcCache if available and same date */
+  /* Patch the LAST point (most recent) with live ohlcCache if available and fresh */
   if(oicPoints.length > 0) {
     var lastPt = oicPoints[oicPoints.length - 1];
     var cached = ohlcCache[filterInst];
-    var todayISO2 = new Date().toLocaleDateString('en-IN',{timeZone:'Asia/Kolkata',year:'numeric',month:'2-digit',day:'2-digit'}).split('/').reverse().join('-');
+    /* todayISO2 removed — it was computed but never used in the condition below.
+       The freshness check (< 5 min) is sufficient without a date comparison. */
     /* Only use live OHLC cache if it was fetched within last 5 minutes (handles 429 stale-cache path) */
     if(cached && (Date.now() - (lastOhlcFetch[filterInst]||0)) < 5*60*1000) {
       if(lastPt.candleHigh == null || cached.high > lastPt.candleHigh) lastPt.candleHigh = cached.high;
@@ -3698,7 +3848,9 @@ function renderOIChart() {
       }
     });
     /* Persist updated log */
-    try { localStorage.setItem(SESSION_KEY, JSON.stringify(sessionLog)); } catch(e) {}
+    /* SESSION_KEY write intentionally removed — sessionLog lives in Firebase.
+       Writing megabytes of JSON here on every ABMD pass burned localStorage
+       quota and silently evicted the history cache (HIST_CACHE_KEY). */
   }
   renderLogTable();
 
@@ -4116,28 +4268,36 @@ function drawOIChart(canvas) {
     ctx.fillRect(ax0, pad.t, ax1 - ax0, abmStripeH);
   }
 
-  /* ── Auto Bias Mode: draw FC trigger markers (vertical line at switch points) ── */
+  /* ── Auto Bias Mode: draw FC/FU trigger markers (vertical line at switch points) ── */
   for(var ai2 = 0; ai2 < oicPoints.length; ai2++) {
     var apt2 = oicPoints[ai2];
-    if(!apt2.fcTrigger) continue;
+    var isFCTrigger = !!apt2.fcTrigger;
+    var isFUTrigger = !!apt2.fuTrigger;
+    if(!isFCTrigger && !isFUTrigger) continue;
     var ftx = minsToX(tMins(apt2.time));
     if(ftx < pad.l || ftx > W - pad.r) continue;
-    /* Draw a vertical alert line */
+    /* FC = blue dashed line (bearish), FU = green dashed line (bullish) */
+    var trigStroke = isFUTrigger
+      ? (isLightMode ? 'rgba(14,158,94,0.80)'   : 'rgba(46,204,136,0.85)')
+      : (isLightMode ? 'rgba(26,95,212,0.80)'   : 'rgba(77,159,255,0.85)');
+    var trigFill = isFUTrigger
+      ? (isLightMode ? '#0e9e5e' : '#2ecc88')
+      : (isLightMode ? '#1a5fd4' : '#4d9fff');
+    var trigLabel = isFUTrigger ? '⚡ FU' : '⚡ FC';
     ctx.save();
-    ctx.strokeStyle = isLightMode ? 'rgba(26,95,212,0.80)' : 'rgba(77,159,255,0.85)';
+    ctx.strokeStyle = trigStroke;
     ctx.lineWidth = 1.5;
     ctx.setLineDash([3, 2]);
     ctx.beginPath(); ctx.moveTo(ftx, pad.t + abmStripeH); ctx.lineTo(ftx, H - pad.b); ctx.stroke();
     ctx.setLineDash([]);
     /* Label */
-    ctx.fillStyle = isLightMode ? '#1a5fd4' : '#4d9fff';
     ctx.font = 'bold 9px "Inter", sans-serif';
     ctx.textAlign = 'center';
     var lblY = pad.t + abmStripeH + 14;
     ctx.fillStyle = isLightMode ? 'rgba(255,255,255,0.85)' : 'rgba(20,20,22,0.75)';
     ctx.fillRect(ftx - 20, lblY - 10, 40, 13);
-    ctx.fillStyle = isLightMode ? '#1a5fd4' : '#4d9fff';
-    ctx.fillText('⚡ RAW', ftx, lblY);
+    ctx.fillStyle = trigFill;
+    ctx.fillText(trigLabel, ftx, lblY);
     ctx.restore();
   }
 
@@ -5024,7 +5184,7 @@ function computeAutoBiasMode(pts) {
           + ' spot_drop=' + spotDropFromPeak.toFixed(0) + 'pts (need ' + fcSpotEntry.toFixed(0) + ')'
           + ' OI_thr=' + (FC_PCT_THRESHOLD*100).toFixed(1) + '%', 'warn');
         /* ── Alert: SMART → RAW (Forced Cover — Bearish crash detected) ── */
-        if(abmdLiveRun && i === pts.length - 1) fireSoundAlert('signal');
+
       }
       /* ── ENTRY: Bullish forced call unwind ── */
       else if(ceDropPct >= FC_PCT_THRESHOLD && spotRiseFromTrough >= fcSpotEntry) {
@@ -5040,7 +5200,7 @@ function computeAutoBiasMode(pts) {
           + ' spot_rise=' + spotRiseFromTrough.toFixed(0) + 'pts (need ' + fcSpotEntry.toFixed(0) + ')'
           + ' OI_thr=' + (FC_PCT_THRESHOLD*100).toFixed(1) + '%', 'warn');
         /* ── Alert: SMART → RAW (Forced Unwind — Bullish breakout detected) ── */
-        if(abmdLiveRun && i === pts.length - 1) fireSoundAlert('signal');
+
       }
     } else {
       /* ── Update trailing extremes each bar while in RAW mode ──
@@ -5146,7 +5306,7 @@ function computeAutoBiasMode(pts) {
         trailingHigh = 0;
         trailingLow  = 0;
         /* ── Alert: RAW → SMART (trailing exit fired — mode returning to normal) ── */
-        if(abmdLiveRun && i === pts.length - 1) fireSoundAlert('signal');
+
       } else if(inRaw && !recovered) {
         /* Still in RAW — log candle availability ONCE per RAW segment for debugging */
         var hasCurCandle  = (p.candleHigh != null || p.candleLow != null);
@@ -5586,45 +5746,12 @@ function getISTTime() {
   };
 }
 
-/* ── triggerWorkerNow — hits /trigger on the Cloudflare Worker ──
-   Makes the worker run its full fetch → compute → Firestore write
-   pipeline immediately, without waiting for the next cron tick.
-   The result arrives via onSnapshot within ~3-5 seconds.
-   Safe to call any time — the worker's same-time dedup guard
-   prevents a duplicate doc if the cron just fired. */
-var _triggerCooldown = false;
-
+/* ── triggerWorkerNow — button press, shows spinner ──
+   Delegates to _doTriggerWorker (defined near the top of the script)
+   which also handles the shared 10-second cooldown so this and
+   triggerWorkerFetch (background) can never double-fire.             */
 function triggerWorkerNow() {
-  if(_triggerCooldown){
-    log('⚡ Trigger: cooldown active (10s) — worker already running', 'warn');
-    return;
-  }
-  _triggerCooldown = true;
-  setTimeout(function(){ _triggerCooldown = false; }, 10000);
-
-  var btn = document.getElementById('fetch_btn');
-  if(btn){ btn.disabled = true; btn.textContent = '⏳ Fetching…'; }
-  log('⚡ Trigger: asking worker to fetch now…', 'ok');
-
-  fetch(PROXY + '/trigger', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' }
-  })
-  .then(function(r){ return r.json(); })
-  .then(function(d){
-    if(d && d.ok){
-      log('⚡ Trigger: worker accepted — snapshot will arrive via onSnapshot in ~3-5s', 'ok');
-    } else {
-      log('⚡ Trigger: worker returned unexpected response: ' + JSON.stringify(d), 'warn');
-    }
-  })
-  .catch(function(e){
-    log('⚡ Trigger: request failed — ' + e.message, 'err');
-    _triggerCooldown = false;
-  })
-  .finally(function(){
-    if(btn){ btn.disabled = false; btn.textContent = '⚡ Fetch Now'; }
-  });
+  _doTriggerWorker('manual', true);
 }
 
 /* ═══════════════════════════════════════════════════════════
