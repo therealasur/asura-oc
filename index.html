@@ -1690,12 +1690,20 @@ function stampAllABMD() {
       abmdLiveRun = false;
       computeAutoBiasMode(pts);
       abmdLiveRun = savedLiveRun;
-      /* Write biasMode back using the sorted array which mirrors pair.snaps order */
+      /* Write biasMode + followBias back using the sorted array which mirrors pair.snaps order.
+         followBias is written locally on EVERY load (even when Firestore's stored
+         value already disagrees/missing) so the header highlight is correct
+         immediately, without waiting for the next worker.js cron tick to
+         overwrite the stored doc — this only affects the in-memory render,
+         never persists back to Firestore. */
       sorted.forEach(function(origSnap, idx) {
         var pt = pts[idx];
         if(!pt) return;
         var modeLabel = pt.biasMode === 'raw' ? 'RAW' : pt.biasMode === 'smart' ? 'SMART' : '—';
-        if(origSnap.data) origSnap.data.autoBiasMode = modeLabel;
+        if(origSnap.data) {
+          origSnap.data.autoBiasMode = modeLabel;
+          origSnap.data.followBias = pt.followBias || null;
+        }
       });
     });
     log('stampAllABMD: done', 'ok');
@@ -5316,6 +5324,21 @@ function computeAutoBiasMode(pts) {
   var triggerSpot = 0;  /* spot at the moment RAW mode triggered (for logging) */
   var trailingHigh = 0; /* highest spot seen since RAW(bull) began — exit when spot falls 60+ below this */
   var trailingLow  = 0; /* lowest spot seen since RAW(bear) began — exit when spot rises 60+ above this */
+  var triggerOverallBias = null, triggerRawBias = null; /* locked at the bar the RAW segment started — used by decideFollow() */
+
+  function dirOf(b){ b=(b||'').toUpperCase(); return b.indexOf('BULL')>=0?'BULL':b.indexOf('BEAR')>=0?'BEAR':'OTHER'; }
+  function decideFollow(triggerOverall, triggerRaw, rawTypeVal){
+    /* Mirrors worker.js's decideFollow(): whichever column actually matched
+       the confirmed direction at the trigger bar is the one to follow;
+       both match → Overall; neither match → mixed (wait for clarity). */
+    var exp = rawTypeVal==='bear' ? 'BEAR' : 'BULL';
+    var ovMatch  = dirOf(triggerOverall) === exp;
+    var rawMatch = dirOf(triggerRaw)     === exp;
+    if(ovMatch && rawMatch)  return 'overall';
+    if(ovMatch && !rawMatch) return 'overall';
+    if(!ovMatch && rawMatch) return 'raw';
+    return 'mixed';
+  }
 
   for(var i = 0; i < pts.length; i++) {
     var p = pts[i];
@@ -5368,6 +5391,8 @@ function computeAutoBiasMode(pts) {
         trailingLow  = spot; /* start trailing low = trigger spot */
         trailingHigh = 0;
         p.fcTrigger = true;
+        triggerOverallBias = p.bias || '—';
+        triggerRawBias     = p.rawBias || '—';
         log('AUTO BIAS: ⚡ BEARISH FC at ' + p.time
           + ' PE Δ=' + (peChgVsPrev/1000).toFixed(0) + 'K'
           + ' (' + (peDropPct*100).toFixed(1) + '% of ' + (peOIFloor/1000).toFixed(0) + 'K)'
@@ -5384,6 +5409,8 @@ function computeAutoBiasMode(pts) {
         trailingHigh = spot; /* start trailing high = trigger spot */
         trailingLow  = 0;
         p.fuTrigger = true;
+        triggerOverallBias = p.bias || '—';
+        triggerRawBias     = p.rawBias || '—';
         log('AUTO BIAS: ⚡ BULLISH FU at ' + p.time
           + ' CE Δ=' + (ceChgVsPrev/1000).toFixed(0) + 'K'
           + ' (' + (ceDropPct*100).toFixed(1) + '% of ' + (ceOIFloor/1000).toFixed(0) + 'K)'
@@ -5490,11 +5517,13 @@ function computeAutoBiasMode(pts) {
         /* ohlcExitUsed = true when exit was triggered by a candle H/L, not snapshot spot */
         p.ohlcExitUsed = recoveryReason.includes('candle') || recoveryReason.includes('OHLC');
         p.exitReason = recoveryReason;
-        inRaw = false;
-        rawType = null;
-        triggerSpot = 0;
-        trailingHigh = 0;
-        trailingLow  = 0;
+        /* NOTE: do NOT flip inRaw/rawType/trigger* here — same fix as worker.js.
+           This exit bar is still the LAST bar of the RAW segment (the Mode
+           Timeline boxes render this same timestamp as the inclusive end of
+           the segment), so it must still be stamped biasMode='raw' with the
+           closing segment's locked followBias. The flip now happens AFTER
+           the stamp below, at the bottom of the loop body, so only the
+           NEXT bar onward becomes 'smart'. */
         /* ── Alert: RAW → SMART (trailing exit fired — mode returning to normal) ── */
 
       } else if(inRaw && !recovered) {
@@ -5513,6 +5542,18 @@ function computeAutoBiasMode(pts) {
     /* Expose trailing extremes for tooltip/debug */
     pts[i].trailingHigh = trailingHigh;
     pts[i].trailingLow  = trailingLow;
+    pts[i].followBias = inRaw ? decideFollow(triggerOverallBias, triggerRawBias, rawType) : null; /* 'overall' | 'raw' | 'mixed' */
+
+    if(recovered) {
+      /* Flip AFTER stamping this bar — takes effect starting next bar. */
+      inRaw = false;
+      rawType = null;
+      triggerSpot = 0;
+      trailingHigh = 0;
+      trailingLow  = 0;
+      triggerOverallBias = null;
+      triggerRawBias = null;
+    }
   }
 
   abmdSegments = buildBiasSegments(pts);
