@@ -289,6 +289,10 @@ body.light .picker-input{color-scheme:light;}
 .follow-bias{box-shadow:inset 0 0 0 1.5px var(--gold);background:var(--gold-bg)!important;border-radius:4px;position:relative;}
 .follow-bias::after{content:'\2713 FOLLOW';font-size:7px;font-weight:700;letter-spacing:0.3px;color:var(--gold);display:block;line-height:1;margin-top:2px;}
 .follow-mixed{display:block;font-size:7px;font-weight:700;letter-spacing:0.3px;color:var(--orange);margin-top:2px;}
+.follow-header{box-shadow:inset 0 0 0 1.5px var(--gold)!important;background:var(--gold-bg)!important;color:var(--gold)!important;position:relative;}
+.follow-header::after{content:'\2713 FOLLOW NOW';display:block;font-size:7px;font-weight:700;letter-spacing:0.3px;color:var(--gold);margin-top:2px;}
+.follow-header-mixed{box-shadow:inset 0 0 0 1.5px var(--orange)!important;background:var(--orange-bg)!important;}
+.follow-header-mixed::after{content:'\26A0 MIXED · WAIT';display:block;font-size:7px;font-weight:700;letter-spacing:0.3px;color:var(--orange);margin-top:2px;}
 .logger-empty{padding:30px;text-align:center;color:var(--text3);font-size:12px;}
 
 /* ── MISC ── */
@@ -1326,7 +1330,7 @@ console.log('OC Firebase Auth ready');
           <tr>
             <th>Date</th><th>Time (IST)</th><th>Type</th>
             <th>Inst</th><th>Expiry</th><th>Spot</th><th>ATM</th>
-            <th>Overall Bias</th><th>🧠 Auto Bias Mode</th><th>Raw OI Bias</th><th>Bias Score</th>
+            <th id="th_overall_bias">Overall Bias</th><th>🧠 Auto Bias Mode</th><th id="th_raw_bias">Raw OI Bias</th><th>Bias Score</th>
             <th>PCR (ATM)</th><th>PCR (Total)</th>
             <th>Max Pain</th><th>Gamma Wall</th>
             <th>IV Skew</th><th>ATM Ratio</th>
@@ -3529,17 +3533,16 @@ function renderLogTable(){
          'overall' → Overall Bias correctly called it (or both did) → follow Overall.
          'raw'     → only Raw OI Bias correctly called it → follow Raw OI Bias.
          'mixed'   → neither matched at trigger → no column highlighted,
-                     wait-for-clarity (shown via the "MIXED" badge instead). */
+                     wait-for-clarity (shown via the "MIXED" badge instead).
+       NOTE: the actual highlight now lives on the COLUMN HEADER (see
+       updateFollowHeader() below), driven by the single most-recent row,
+       so it doesn't repaint a box on every single row of a RAW segment.
+       Each row still gets a small inline "MIXED · WAIT" badge when that
+       specific historical bar was a no-trade/wait bar, for backtesting
+       context — but no per-row box highlight. */
     var followBias = d.followBias || null; /* null/undefined → older rows saved before this field existed */
-    var biasFollowClass='', rawFollowClass='', mixedBadge='';
-    if(autoBiasMode==='SMART'){
-      biasFollowClass=' class="follow-bias"';
-    } else if(autoBiasMode==='RAW'){
-      if(followBias==='overall') biasFollowClass=' class="follow-bias"';
-      else if(followBias==='raw') rawFollowClass=' class="follow-bias"';
-      else if(followBias==='mixed') mixedBadge='<span class="follow-mixed">MIXED · WAIT</span>';
-      /* followBias missing (legacy row) → no highlight, falls through silently */
-    }
+    var mixedBadge='';
+    if(autoBiasMode==='RAW' && followBias==='mixed') mixedBadge='<span class="follow-mixed">MIXED · WAIT</span>';
     tr.innerHTML=[
       '<td>'+s.date+'</td>',
       '<td style="font-family:monospace;">'+s.time+'</td>',
@@ -3548,9 +3551,9 @@ function renderLogTable(){
       '<td style="font-family:monospace;">'+(d.expiry||'—')+'</td>',
       '<td style="font-family:monospace;">'+(d.spot!=null?parseFloat(d.spot).toFixed(1):'—')+'</td>',
       '<td style="font-family:monospace;">'+(d.atm||'—')+'</td>',
-      '<td'+biasFollowClass+' style="font-weight:700;color:'+biasColor+';">'+displayBias+'</td>',
+      '<td style="font-weight:700;color:'+biasColor+';">'+displayBias+'</td>',
       '<td>'+abmHtml+mixedBadge+'</td>',
-      '<td'+rawFollowClass+' style="font-weight:600;color:'+rawColor+';font-size:10px;">'+rawBias+'</td>',
+      '<td style="font-weight:600;color:'+rawColor+';font-size:10px;">'+rawBias+'</td>',
       '<td style="font-family:monospace;">'+(d.biasScore||'—')+'</td>',
       '<td style="font-family:monospace;">'+(d.atmPCR!=null?parseFloat(d.atmPCR).toFixed(2):'—')+'</td>',
       '<td style="font-family:monospace;">'+(d.totalPCR!=null?parseFloat(d.totalPCR).toFixed(2):'—')+'</td>',
@@ -3570,6 +3573,33 @@ function renderLogTable(){
     ].join('');
     tbody.appendChild(tr);
   });
+  updateFollowHeader();
+}
+
+/* Highlights the Overall Bias / Raw OI Bias column HEADER (not individual
+   row cells) based on the single most-recent snapshot (sessionLog[0], since
+   rows are unshift'd newest-first). This is the "right now" state — it
+   persists as-is on screen while you scroll through historical rows below,
+   and only moves to the other header once a NEW live snapshot arrives with
+   a different autoBiasMode/followBias. Avoids repainting a box on every row
+   of a multi-minute RAW segment. */
+function updateFollowHeader(){
+  var thOverall=document.getElementById('th_overall_bias');
+  var thRaw=document.getElementById('th_raw_bias');
+  if(!thOverall||!thRaw)return;
+  thOverall.className=''; thRaw.className='';
+  if(!sessionLog.length)return;
+  var latest=sessionLog[0]; var d=latest.data||{};
+  var autoBiasMode=d.autoBiasMode||'—';
+  var followBias=d.followBias||null;
+  if(autoBiasMode==='SMART'){
+    thOverall.className='follow-header';
+  } else if(autoBiasMode==='RAW'){
+    if(followBias==='overall') thOverall.className='follow-header';
+    else if(followBias==='raw') thRaw.className='follow-header';
+    else if(followBias==='mixed'){ thOverall.className='follow-header-mixed'; thRaw.className='follow-header-mixed'; }
+    /* followBias missing (legacy row, pre-fix) → no header highlight */
+  }
 }
 
 /* ── Date/Time picker ── */
