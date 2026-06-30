@@ -286,6 +286,9 @@ body.light .picker-input{color-scheme:light;}
 .logger-table .eod-row td{background:rgba(255,193,7,0.09);border-bottom:1px solid rgba(255,193,7,0.18)!important;}
 .logger-table .eod-row:hover td{background:rgba(255,193,7,0.15)!important;}
 .eod-tag{font-size:8px;font-weight:700;padding:1px 5px;border-radius:4px;background:var(--gold-bg);color:var(--gold);border:1px solid rgba(255,193,7,0.25);margin-left:4px;letter-spacing:0.3px;}
+.follow-bias{box-shadow:inset 0 0 0 1.5px var(--gold);background:var(--gold-bg)!important;border-radius:4px;position:relative;}
+.follow-bias::after{content:'\2713 FOLLOW';font-size:7px;font-weight:700;letter-spacing:0.3px;color:var(--gold);display:block;line-height:1;margin-top:2px;}
+.follow-mixed{display:block;font-size:7px;font-weight:700;letter-spacing:0.3px;color:var(--orange);margin-top:2px;}
 .logger-empty{padding:30px;text-align:center;color:var(--text3);font-size:12px;}
 
 /* ── MISC ── */
@@ -3517,6 +3520,26 @@ function renderLogTable(){
     var abmColor=autoBiasMode==='RAW'?'var(--blue)':autoBiasMode==='SMART'?'var(--orange)':'var(--text3)';
     var abmBg=autoBiasMode==='RAW'?'background:var(--blue-bg);border:1px solid var(--blue-border);color:var(--blue);':autoBiasMode==='SMART'?'background:var(--orange-bg);border:1px solid var(--orange-border);color:var(--orange);':'color:var(--text3);';
     var abmHtml=autoBiasMode==='—'?'<span style="color:var(--text3);">—</span>':'<span style="display:inline-flex;align-items:center;padding:1px 6px;border-radius:8px;font-size:9px;font-weight:700;letter-spacing:0.3px;'+abmBg+'">'+autoBiasMode+'</span>';
+    /* Which column should the trader follow right now?
+       SMART → always Overall Bias (already inverted display bias).
+       RAW   → depends on which column actually matched the confirmed price
+       direction AT THE TRIGGER BAR (computed once, server-side, in worker.js
+       decideFollow() — exact port of the dashboard's whichBiasToFollow()).
+       d.followBias is 'overall' | 'raw' | 'mixed':
+         'overall' → Overall Bias correctly called it (or both did) → follow Overall.
+         'raw'     → only Raw OI Bias correctly called it → follow Raw OI Bias.
+         'mixed'   → neither matched at trigger → no column highlighted,
+                     wait-for-clarity (shown via the "MIXED" badge instead). */
+    var followBias = d.followBias || null; /* null/undefined → older rows saved before this field existed */
+    var biasFollowClass='', rawFollowClass='', mixedBadge='';
+    if(autoBiasMode==='SMART'){
+      biasFollowClass=' class="follow-bias"';
+    } else if(autoBiasMode==='RAW'){
+      if(followBias==='overall') biasFollowClass=' class="follow-bias"';
+      else if(followBias==='raw') rawFollowClass=' class="follow-bias"';
+      else if(followBias==='mixed') mixedBadge='<span class="follow-mixed">MIXED · WAIT</span>';
+      /* followBias missing (legacy row) → no highlight, falls through silently */
+    }
     tr.innerHTML=[
       '<td>'+s.date+'</td>',
       '<td style="font-family:monospace;">'+s.time+'</td>',
@@ -3525,9 +3548,9 @@ function renderLogTable(){
       '<td style="font-family:monospace;">'+(d.expiry||'—')+'</td>',
       '<td style="font-family:monospace;">'+(d.spot!=null?parseFloat(d.spot).toFixed(1):'—')+'</td>',
       '<td style="font-family:monospace;">'+(d.atm||'—')+'</td>',
-      '<td style="font-weight:700;color:'+biasColor+';">'+displayBias+'</td>',
-      '<td>'+abmHtml+'</td>',
-      '<td style="font-weight:600;color:'+rawColor+';font-size:10px;">'+rawBias+'</td>',
+      '<td'+biasFollowClass+' style="font-weight:700;color:'+biasColor+';">'+displayBias+'</td>',
+      '<td>'+abmHtml+mixedBadge+'</td>',
+      '<td'+rawFollowClass+' style="font-weight:600;color:'+rawColor+';font-size:10px;">'+rawBias+'</td>',
       '<td style="font-family:monospace;">'+(d.biasScore||'—')+'</td>',
       '<td style="font-family:monospace;">'+(d.atmPCR!=null?parseFloat(d.atmPCR).toFixed(2):'—')+'</td>',
       '<td style="font-family:monospace;">'+(d.totalPCR!=null?parseFloat(d.totalPCR).toFixed(2):'—')+'</td>',
