@@ -289,9 +289,9 @@ body.light .picker-input{color-scheme:light;}
 .follow-bias{box-shadow:inset 0 0 0 1.5px var(--gold);background:var(--gold-bg)!important;border-radius:4px;position:relative;}
 .follow-bias::after{content:'\2713 FOLLOW';font-size:7px;font-weight:700;letter-spacing:0.3px;color:var(--gold);display:block;line-height:1;margin-top:2px;}
 .follow-mixed{display:block;font-size:7px;font-weight:700;letter-spacing:0.3px;color:var(--orange);margin-top:2px;}
-.follow-header{box-shadow:inset 0 0 0 1.5px var(--gold)!important;background:var(--gold-bg)!important;color:var(--gold)!important;position:relative;}
+.follow-header{box-shadow:inset 0 0 0 1.5px var(--gold)!important;background:linear-gradient(var(--gold-bg),var(--gold-bg)),var(--bg4)!important;color:var(--gold)!important;position:relative;}
 .follow-header::after{content:'\2713 FOLLOW NOW';position:absolute;left:10px;bottom:2px;font-size:7px;font-weight:700;letter-spacing:0.3px;color:var(--gold);white-space:nowrap;pointer-events:none;}
-.follow-header-mixed{box-shadow:inset 0 0 0 1.5px var(--orange)!important;background:var(--orange-bg)!important;position:relative;}
+.follow-header-mixed{box-shadow:inset 0 0 0 1.5px var(--orange)!important;background:linear-gradient(var(--orange-bg),var(--orange-bg)),var(--bg4)!important;position:relative;}
 .follow-header-mixed::after{content:'\26A0 MIXED \00B7 WAIT';position:absolute;left:10px;bottom:2px;font-size:7px;font-weight:700;letter-spacing:0.3px;color:var(--orange);white-space:nowrap;pointer-events:none;}
 .logger-empty{padding:30px;text-align:center;color:var(--text3);font-size:12px;}
 
@@ -3529,8 +3529,10 @@ function renderLogTable(){
   countEl.textContent=sessionLog.length+' record'+(sessionLog.length!==1?'s':'');
   empty.style.display='none';table.style.display='table';tbody.innerHTML='';
   sessionLog.forEach(function(s){
-    var d=s.data||{};var tr=document.createElement('tr');if(s.type==='eod')tr.className='eod-row';
-    var typeHtml=s.type==='eod'?'<span style="color:var(--gold);">EOD</span><span class="eod-tag">3:30PM</span>':'<span style="color:var(--teal);">Live</span>';
+    var d=s.data||{};var tr=document.createElement('tr');
+    var isEod = isEodSnap(s);
+    if(isEod)tr.className='eod-row';
+    var typeHtml=isEod?'<span style="color:var(--gold);">EOD</span><span class="eod-tag">3:30PM</span>':'<span style="color:var(--teal);">Live</span>';
     var displayBias=d.overallBias||'—';
     var rawBias=d.overallBiasRaw||d._rawBias||displayBias;
     var autoBiasMode=d.autoBiasMode||'—';
@@ -3640,7 +3642,7 @@ function populateTimePicker(isoDate,availDates){
   if(!isoDate||!availDates.has(isoDate)){timeInput.innerHTML='<option value="">— no data for this date —</option>';timeInput.disabled=true;viewBtn.disabled=true;return;}
   var snaps=sessionLog.map(function(s,i){return{s:s,i:i};}).filter(function(x){return logDateToISO(x.s.date)===isoDate;}).sort(function(a,b){return b.s.time.localeCompare(a.s.time);});
   var allOpt=document.createElement('option');allOpt.value='all';allOpt.textContent='All snapshots ('+snaps.length+' recorded)';timeInput.appendChild(allOpt);
-  snaps.forEach(function(x){var opt=document.createElement('option');opt.value=x.i;var eodMark=x.s.type==='eod'?' ★ EOD':'';opt.textContent=x.s.time+eodMark;timeInput.appendChild(opt);});
+  snaps.forEach(function(x){var opt=document.createElement('option');opt.value=x.i;var eodMark=isEodSnap(x.s)?' ★ EOD':'';opt.textContent=x.s.time+eodMark;timeInput.appendChild(opt);});
   timeInput.disabled=false;viewBtn.disabled=false;
 }
 
@@ -3658,8 +3660,8 @@ function viewSnapshot(){
     table+='</tr></thead><tbody>';
     snaps.forEach(function(x){
       var s=x.s;var d=s.data||{};
-      var rowBg=s.type==='eod'?'background:rgba(255,193,7,0.05);':'';
-      var typeHtml=s.type==='eod'?'<span style="color:var(--gold);font-weight:700;">EOD</span>':'<span style="color:var(--teal);">Live</span>';
+      var rowBg=isEodSnap(s)?'background:rgba(255,193,7,0.05);':'';
+      var typeHtml=isEodSnap(s)?'<span style="color:var(--gold);font-weight:700;">EOD</span>':'<span style="color:var(--teal);">Live</span>';
       var biasColor=(d.overallBias||'')?(d.overallBias.includes('BULL')?'var(--green)':d.overallBias.includes('BEAR')?'var(--red)':'var(--text2)'):'var(--text2)';
       table+='<tr style="'+rowBg+'">';
       table+='<td style="padding:7px 10px;border-bottom:1px solid var(--border);font-family:monospace;color:var(--text2);">'+s.time+'</td>';
@@ -3686,7 +3688,7 @@ function viewSnapshot(){
   }
   var idx=parseInt(val);if(isNaN(idx)||!sessionLog[idx])return;
   var s=sessionLog[idx];var d=s.data||{};
-  document.getElementById('history_banner_label').textContent=(s.type==='eod'?'★ EOD — ':'Live Snapshot — ')+s.date;
+  document.getElementById('history_banner_label').textContent=(isEodSnap(s)?'★ EOD — ':'Live Snapshot — ')+s.date;
   document.getElementById('history_banner_time').textContent='Captured at '+s.time+' IST · '+(INSTRUMENTS[d.inst]||{label:d.inst}).label+' · VIX '+(d.vix!=null?parseFloat(d.vix).toFixed(2):'—');
   var content=document.getElementById('history_content');
   var biasColor=(d.overallBias||'')?(d.overallBias.includes('BULL')?'var(--green)':d.overallBias.includes('BEAR')?'var(--red)':'var(--gray)'):'var(--gray)';
@@ -3892,6 +3894,21 @@ function timeToMinutes(tStr){
   if(isPM && h < 12) h += 12;  /* 1:xx pm → 13 */
   if(isAM && h === 12) h = 0;  /* 12:xx am → 0  */
   return h*60 + m;
+}
+
+/* ── Single source of truth for "is this the EOD snapshot?" ──
+   Prefers the stored type:'eod' tag (set server-side by worker.js), but
+   falls back to checking the row's own time against the 15:30 IST close
+   threshold. Some historical docs predate the worker's current EOD-tagging
+   logic and are permanently frozen with type:'auto' even though they were
+   genuinely captured at/after market close — their docIds are date+time+
+   inst keyed so they can never be corrected server-side after the fact.
+   This makes every EOD-aware UI element (Session Logger row, time-picker
+   ★ marker, history banner) agree, for both old and new data. */
+function isEodSnap(s){
+  if(!s) return false;
+  if(s.type==='eod') return true;
+  return timeToMinutes(s.time) >= 930; /* 15*60+30 = 15:30 IST */
 }
 
 function renderOIChart() {
