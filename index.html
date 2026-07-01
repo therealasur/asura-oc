@@ -1895,10 +1895,26 @@ function renderHeroFromSnapshot(inst){
   for(var i=0;i<sessionLog.length;i++){
     if((sessionLog[i].data||{}).inst === inst){ latest = sessionLog[i]; break; }
   }
-  if(!latest || !latest.data) return false;
+  if(!latest || !latest.data) { log('renderHeroFromSnapshot: no sessionLog entry for inst=' + inst + ' — header/panels not updated', 'warn'); return false; }
   var d = latest.data;
   var cfg = INSTRUMENTS[inst];
-  if(!cfg || d.spot==null) return false;
+  if(!cfg || d.spot==null) { log('renderHeroFromSnapshot: missing cfg or spot for inst=' + inst + ' (spot=' + d.spot + ') — header/panels not updated', 'warn'); return false; }
+
+  /* ── v7.4 FIX: header SPOT/VIX chips moved OUT of the try block below and
+     run FIRST, unconditionally, as soon as we have a valid `d`. Previously
+     these lived after several DOM writes inside the same try/catch as the
+     bias-hero/signal-card/S&R renders — any one of those throwing (or an
+     early return above firing silently, with no log) meant the header
+     chips could go an entire session without updating, and nothing in the
+     debug panel would say why. Session Logger / ABMD panel are rendered by
+     a completely separate function (renderOIChart), so their working is
+     NOT proof this function succeeded — that was the blind spot. ── */
+  var _spotEl = document.getElementById('spot_val');
+  if(_spotEl) _spotEl.textContent = parseFloat(d.spot).toFixed(1);
+  if(d.vix != null && (vixGlobal == null || Math.abs(parseFloat(d.vix) - vixGlobal) > 0.01)) {
+    vixGlobal = parseFloat(d.vix);
+    if(typeof updateVIXChip === 'function') updateVIXChip();
+  }
 
   var biasObj = {
     dir:     d.overallBiasRaw || d._rawBias || d.overallBias || '—',
@@ -1912,19 +1928,6 @@ function renderHeroFromSnapshot(inst){
     document.getElementById('bias_inst_label').textContent=cfg.label;
     document.getElementById('bias_expiry_label').textContent=fmtExpiry(d.expiry)+' expiry';
     document.getElementById('sr_spot_badge').textContent='SPOT '+parseFloat(d.spot).toFixed(1);
-
-    /* ── FIX: update header SPOT chip from snapshot (worker-mode never calls
-       processAndRender, so spot_val stayed '—' all session without this) ── */
-    var _spotEl = document.getElementById('spot_val');
-    if(_spotEl) _spotEl.textContent = parseFloat(d.spot).toFixed(1);
-
-    /* ── FIX: update header VIX chip from snapshot when the live VIX fetch
-       hasn't run yet (pure Firestore reader mode — fetchAll/fetchVIX only runs
-       on manual button press). Worker saves vix into snap.data.vix each tick. ── */
-    if(d.vix != null && (vixGlobal == null || Math.abs(parseFloat(d.vix) - vixGlobal) > 0.01)) {
-      vixGlobal = parseFloat(d.vix);
-      if(typeof updateVIXChip === 'function') updateVIXChip();
-    }
 
     renderStep('biasHero', function(){renderBiasHero(biasObj, d.atmPCR, d.netCeChg, d.netPeChg, d.atmRatio, d.greeksDivergence);});
     renderStep('signals', function(){renderSignalCards(d.maxPain, d.totalPCR, d.ivSkew, d.ceNearBuild, d.peNearBuild, d.atmRatio, cfg, d.gammaWall, d.spot, d.atmVega, d.atmTheta);});
