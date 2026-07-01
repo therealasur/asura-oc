@@ -1757,7 +1757,11 @@ function ocInitApp() {
 }
 
 /* ── Firebase: load snapshots ── */
-function stampAllABMD() {
+var _lastAbmdAlertKey = null; /* tracks inst|date|time of the last point we allowed
+  to alert-check, so a genuinely-new live tick fires the sound exactly once —
+  even if onSnapshot re-fires for the same data (metadata-only change, reconnect, etc). */
+
+function stampAllABMD(isLiveTick) {
   try {
     var pairs = {};
     sessionLog.forEach(function(s) {
@@ -1771,6 +1775,12 @@ function stampAllABMD() {
     });
     var pairKeys = Object.keys(pairs);
     log('stampAllABMD: processing ' + pairKeys.length + ' inst+date pairs', 'ok');
+    /* Only the pair matching the currently-viewed instrument + today's date can
+       ever be the source of a live alert — every other pair (other days, other
+       instruments) is always recomputed with abmdLiveRun forced false below,
+       exactly as before. This prevents old FC/FU/exit bars in historical pairs
+       from re-firing the sound every time stampAllABMD runs. */
+    var todayISO = getIST().isoDate;
     pairKeys.forEach(function(key) {
       var pair = pairs[key];
       var sorted = pair.snaps.slice().sort(function(a, b) {
@@ -1794,8 +1804,24 @@ function stampAllABMD() {
           candleLow:  d.candleLow  != null ? parseFloat(d.candleLow)  : null
         };
       });
+      /* ── Live-alert gate ──
+         Alerts are allowed ONLY when: (a) this call is a genuine live tick
+         (isLiveTick===true, set by the onSnapshot handler — never by initial
+         load / date navigation / manual refresh), (b) this pair is the
+         instrument+date currently on screen, and (c) the pair's newest point
+         is one we haven't already alert-checked (dedupes repeat onSnapshot
+         fires for the same data, e.g. metadata-only changes or reconnects). */
+      var allowAlert = false;
+      if(isLiveTick && pair.inst === currentInst && pair.date === todayISO && pts.length) {
+        var lastPt = pts[pts.length - 1];
+        var alertKey = pair.inst + '|' + pair.date + '|' + lastPt.time;
+        if(alertKey !== _lastAbmdAlertKey) {
+          allowAlert = true;
+          _lastAbmdAlertKey = alertKey;
+        }
+      }
       var savedLiveRun = abmdLiveRun;
-      abmdLiveRun = false;
+      abmdLiveRun = allowAlert;
       computeAutoBiasMode(pts);
       abmdLiveRun = savedLiveRun;
       /* Write biasMode + followBias back using the sorted array which mirrors pair.snaps order.
@@ -1887,6 +1913,19 @@ function renderHeroFromSnapshot(inst){
     document.getElementById('bias_expiry_label').textContent=fmtExpiry(d.expiry)+' expiry';
     document.getElementById('sr_spot_badge').textContent='SPOT '+parseFloat(d.spot).toFixed(1);
 
+    /* ── FIX: update header SPOT chip from snapshot (worker-mode never calls
+       processAndRender, so spot_val stayed '—' all session without this) ── */
+    var _spotEl = document.getElementById('spot_val');
+    if(_spotEl) _spotEl.textContent = parseFloat(d.spot).toFixed(1);
+
+    /* ── FIX: update header VIX chip from snapshot when the live VIX fetch
+       hasn't run yet (pure Firestore reader mode — fetchAll/fetchVIX only runs
+       on manual button press). Worker saves vix into snap.data.vix each tick. ── */
+    if(d.vix != null && (vixGlobal == null || Math.abs(parseFloat(d.vix) - vixGlobal) > 0.01)) {
+      vixGlobal = parseFloat(d.vix);
+      if(typeof updateVIXChip === 'function') updateVIXChip();
+    }
+
     renderStep('biasHero', function(){renderBiasHero(biasObj, d.atmPCR, d.netCeChg, d.netPeChg, d.atmRatio, d.greeksDivergence);});
     renderStep('signals', function(){renderSignalCards(d.maxPain, d.totalPCR, d.ivSkew, d.ceNearBuild, d.peNearBuild, d.atmRatio, cfg, d.gammaWall, d.spot, d.atmVega, d.atmTheta);});
 
@@ -1971,7 +2010,9 @@ function ocLoadFromFirebase() {
 
           renderLogTable(); updateHistoryDropdown();
           renderOIChart(); renderVegaChart();
-          stampAllABMD();
+          stampAllABMD(true); /* isLiveTick=true — allows the ABMD sound alert
+            to fire for a genuinely new snapshot on the currently-viewed
+            inst/date (see gate logic inside stampAllABMD). */
           renderHeroFromSnapshot(currentInst);
 
           /* Fire bias change signal alert — reads from sessionLog directly
@@ -3501,12 +3542,20 @@ function saveSnapshot(type){
   delete snap.data._rawBias;
   delete snap.data._rawBiasObj;
 
-  /* Store live OHLC candle data so ABMD can use it for historical exit detection */
+  /* Store live OHLC candle data so ABMD can use it for historical exit detection.
+     ── v7.4 FIX (same defect as the render-side OHLC patch, but this one
+     writes to Firestore, so a stale hit here persists into history, not
+     just the current screen) ── See the matching fix + comment near
+     "ABMD OHLC patch applied to last point" for the full root-cause writeup.
+     Tightened from 5min to 90s so a candle from several minutes back (e.g.
+     during a 429 stretch) can't be stamped onto THIS minute's snapshot. */
   var cachedOHLC = ohlcCache[currentInst];
-  if(cachedOHLC && (Date.now() - (lastOhlcFetch[currentInst]||0)) < 5*60*1000) {
+  if(cachedOHLC && (Date.now() - (lastOhlcFetch[currentInst]||0)) < 90*1000) {
     snap.data.candleHigh = cachedOHLC.high;
     snap.data.candleLow  = cachedOHLC.low;
     log('Snapshot OHLC stored: H=' + cachedOHLC.high + ' L=' + cachedOHLC.low, 'ok');
+  } else if(cachedOHLC) {
+    log('Snapshot OHLC skipped — cache is ' + Math.round((Date.now() - (lastOhlcFetch[currentInst]||0))/1000) + 's old, may belong to a stale bar', 'warn');
   }
 
   /* ── Compute autoBiasMode for THIS snapshot — AUTHORITATIVE METHOD ──
@@ -3739,10 +3788,14 @@ function updateHistoryDropdown(){
   var availDates=new Set();
   sessionLog.forEach(function(s){var iso=logDateToISO(s.date);if(iso)availDates.add(iso);});
   var sorted=Array.from(availDates).sort();var oldest=sorted[0],newest=sorted[sorted.length-1];
-  dateInput.disabled=false;dateInput.min=oldest;dateInput.max=newest;
-  if(!dateInput.value||!availDates.has(dateInput.value))dateInput.value=newest;
+  /* No min — allows selecting ANY past date so on-demand fetch triggers
+     for dates older than the 10-day cold start window.
+     max = today so future dates can't be picked.                        */
+  var todayISO=(function(){var fmt=new Intl.DateTimeFormat('en-CA',{timeZone:'Asia/Kolkata',year:'numeric',month:'2-digit',day:'2-digit'});return fmt.format(new Date());})();
+  dateInput.disabled=false;dateInput.min='';dateInput.max=todayISO;
+  if(!dateInput.value)dateInput.value=newest;
   var count=availDates.size;
-  hint.innerHTML='<span>'+count+' day'+(count!==1?'s':'')+' logged</span> · oldest: '+sorted[0]+' · latest: '+newest;
+  hint.innerHTML='<span>'+count+' day'+(count!==1?'s':'')+' logged</span> · oldest: '+oldest+' · latest: '+newest;
   populateTimePicker(dateInput.value,availDates);
 }
 function onPickerDateChange(){
@@ -3817,7 +3870,13 @@ function onPickerDateChange(){
 }
 function populateTimePicker(isoDate,availDates){
   var timeInput=document.getElementById('picker_time');var viewBtn=document.getElementById('view_snap_btn');timeInput.innerHTML='';
-  if(!isoDate||!availDates.has(isoDate)){timeInput.innerHTML='<option value="">— no data for this date —</option>';timeInput.disabled=true;viewBtn.disabled=true;return;}
+  if(!isoDate){timeInput.innerHTML='<option value="">— pick a date first —</option>';timeInput.disabled=true;viewBtn.disabled=true;return;}
+  if(!availDates.has(isoDate)){
+    /* Date not in sessionLog yet — on-demand fetch will populate it.
+       Show a neutral placeholder so the user knows something is happening. */
+    timeInput.innerHTML='<option value="">⏳ Loading data for '+isoDate+'…</option>';
+    timeInput.disabled=true;viewBtn.disabled=true;return;
+  }
   var snaps=sessionLog.map(function(s,i){return{s:s,i:i};}).filter(function(x){return logDateToISO(x.s.date)===isoDate;}).sort(function(a,b){return b.s.time.localeCompare(a.s.time);});
   var allOpt=document.createElement('option');allOpt.value='all';allOpt.textContent='All snapshots ('+snaps.length+' recorded)';timeInput.appendChild(allOpt);
   snaps.forEach(function(x){var opt=document.createElement('option');opt.value=x.i;var eodMark=isEodSnap(x.s)?' ★ EOD':'';opt.textContent=x.s.time+eodMark;timeInput.appendChild(opt);});
@@ -4197,17 +4256,33 @@ function renderOIChart() {
     };
   });
 
-  /* Patch the LAST point (most recent) with live ohlcCache if available and fresh */
+  /* Patch the LAST point (most recent) with live ohlcCache if available and fresh.
+     ── v7.4 FIX (false RAW→SMART exit bug) ──
+     Root cause: this block previously (a) reused fetchSpotOHLC()'s 5-minute
+     outage-fallback window to answer a different question — "is this cached
+     candle THE current bar" — and (b) merged via min(low)/max(high) instead
+     of replacing. A candle fetched several minutes ago (e.g. during a 429
+     rate-limit stretch) is a DIFFERENT, already-closed 1-min bar; merging it
+     in could silently drag lastPt.candleLow down to an unrelated old low
+     (or candleHigh up to an unrelated old high) and never self-correct,
+     since ohlcCache[inst] is one shared slot reused every render. The
+     trailing-exit check reads exactly this field, so a stale merge = a
+     false RAW→SMART exit with no trace in Firestore (only worker.js's own
+     fresh-every-tick fetch gets written there — this corruption is
+     browser-local only).
+     FIX: (1) tighten the window to ~90s — one normal poll cycle, not a
+     multi-minute outage tolerance; (2) REPLACE instead of merge, so a
+     stale value can never "stick" past the next correct fetch. */
   if(oicPoints.length > 0) {
     var lastPt = oicPoints[oicPoints.length - 1];
     var cached = ohlcCache[filterInst];
-    /* todayISO2 removed — it was computed but never used in the condition below.
-       The freshness check (< 5 min) is sufficient without a date comparison. */
-    /* Only use live OHLC cache if it was fetched within last 5 minutes (handles 429 stale-cache path) */
-    if(cached && (Date.now() - (lastOhlcFetch[filterInst]||0)) < 5*60*1000) {
-      if(lastPt.candleHigh == null || cached.high > lastPt.candleHigh) lastPt.candleHigh = cached.high;
-      if(lastPt.candleLow  == null || cached.low  < lastPt.candleLow)  lastPt.candleLow  = cached.low;
+    var ohlcCacheAge = Date.now() - (lastOhlcFetch[filterInst]||0);
+    if(cached && ohlcCacheAge < 90*1000) {
+      lastPt.candleHigh = cached.high;
+      lastPt.candleLow  = cached.low;
       log('ABMD OHLC patch applied to last point: H=' + lastPt.candleHigh + ' L=' + lastPt.candleLow, 'ok');
+    } else if(cached) {
+      log('ABMD OHLC patch skipped — cache is ' + Math.round(ohlcCacheAge/1000) + 's old, may belong to a stale bar', 'warn');
     }
   }
 
@@ -5601,7 +5676,7 @@ function computeAutoBiasMode(pts) {
           + ' spot_drop=' + spotDropFromPeak.toFixed(0) + 'pts (need ' + fcSpotEntry.toFixed(0) + ')'
           + ' OI_thr=' + (FC_PCT_THRESHOLD*100).toFixed(1) + '%', 'warn');
         /* ── Alert: SMART → RAW (Forced Cover — Bearish crash detected) ── */
-
+        if(abmdLiveRun && i === pts.length - 1) fireSoundAlert('signal');
       }
       /* ── ENTRY: Bullish forced call unwind ── */
       else if(ceDropPct >= FC_PCT_THRESHOLD && spotRiseFromTrough >= fcSpotEntry) {
@@ -5619,7 +5694,7 @@ function computeAutoBiasMode(pts) {
           + ' spot_rise=' + spotRiseFromTrough.toFixed(0) + 'pts (need ' + fcSpotEntry.toFixed(0) + ')'
           + ' OI_thr=' + (FC_PCT_THRESHOLD*100).toFixed(1) + '%', 'warn');
         /* ── Alert: SMART → RAW (Forced Unwind — Bullish breakout detected) ── */
-
+        if(abmdLiveRun && i === pts.length - 1) fireSoundAlert('signal');
       }
     } else {
       /* ── Update trailing extremes each bar while in RAW mode ──
@@ -5727,7 +5802,7 @@ function computeAutoBiasMode(pts) {
            the stamp below, at the bottom of the loop body, so only the
            NEXT bar onward becomes 'smart'. */
         /* ── Alert: RAW → SMART (trailing exit fired — mode returning to normal) ── */
-
+        if(abmdLiveRun && i === pts.length - 1) fireSoundAlert('signal');
       } else if(inRaw && !recovered) {
         /* Still in RAW — log candle availability ONCE per RAW segment for debugging */
         var hasCurCandle  = (p.candleHigh != null || p.candleLow != null);
