@@ -643,7 +643,7 @@ window._ocUnsubscribeSnapshots = null;
 ──────────────────────────────────────────────────────────────────────── */
 
 var HIST_CACHE_KEY = 'asura_hist_cache';
-var HIST_CACHE_VER = 2; /* bump this to force a full refresh if schema changes */
+var HIST_CACHE_VER = 3; /* v3: 10-day cold start + on-demand date loading */
 
 function _loadHistCache() {
   try {
@@ -651,22 +651,22 @@ function _loadHistCache() {
     if (!raw) return null;
     var obj = JSON.parse(raw);
     if (!obj || obj.ver !== HIST_CACHE_VER) return null;
-    return obj; /* { ver, cachedUpTo, rows: [...] } */
+    if (!obj.fetchedDates) obj.fetchedDates = [];
+    return obj; /* { ver, cachedUpTo, rows:[...], fetchedDates:[...] } */
   } catch(e) { return null; }
 }
 
-function _saveHistCache(rows, cachedUpTo) {
+function _saveHistCache(rows, cachedUpTo, fetchedDates) {
   try {
-    var obj = { ver: HIST_CACHE_VER, cachedUpTo: cachedUpTo, rows: rows };
+    var obj = { ver: HIST_CACHE_VER, cachedUpTo: cachedUpTo, rows: rows, fetchedDates: fetchedDates || [] };
     localStorage.setItem(HIST_CACHE_KEY, JSON.stringify(obj));
   } catch(e) {
-    /* localStorage full — clear and try again with just the last 500 rows */
     try {
       localStorage.removeItem(HIST_CACHE_KEY);
-      var trimmed = rows.slice(0, 500);
-      localStorage.setItem(HIST_CACHE_KEY, JSON.stringify({ ver: HIST_CACHE_VER, cachedUpTo: cachedUpTo, rows: trimmed }));
-      console.warn('Hist cache trimmed to 500 rows (localStorage quota)');
-    } catch(e2) { console.warn('Hist cache save failed:', e2); }
+      var trimmed = rows.slice(0, 1500);
+      localStorage.setItem(HIST_CACHE_KEY, JSON.stringify({ ver: HIST_CACHE_VER, cachedUpTo: cachedUpTo, rows: trimmed, fetchedDates: fetchedDates || [] }));
+      console.warn('[Cache] Trimmed to 1500 rows (localStorage quota)');
+    } catch(e2) { console.warn('[Cache] Cache save failed:', e2); }
   }
 }
 
@@ -774,7 +774,9 @@ window._ocSubscribeSnapshots = function(onUpdate, forced) {
      with cachedUpTo = todayEndTs, and unsubscribes.                   */
   function sealEODAndStop(allRows) {
     console.log('[Cache] EOD seal — merging ' + allRows.length + ' rows into cache and unsubscribing');
-    _saveHistCache(allRows, todayEndTs);
+    var existingCache = _loadHistCache();
+    var fd = existingCache ? existingCache.fetchedDates : [];
+    _saveHistCache(allRows, todayEndTs, fd);
     if (window._ocUnsubscribeSnapshots) {
       window._ocUnsubscribeSnapshots();
       window._ocUnsubscribeSnapshots = null;
@@ -838,7 +840,7 @@ window._ocSubscribeSnapshots = function(onUpdate, forced) {
       var newRows = [];
       deltaSnap.forEach(function(d){ newRows.push(d.data()); });
       var merged = newRows.concat(cache.rows);
-      _saveHistCache(merged, yesterdayEndTs);
+      _saveHistCache(merged, yesterdayEndTs, cache.fetchedDates || []);
       console.log('[Cache] Delta: +' + newRows.length + ' rows → ' + merged.length + ' total cached');
       attachLiveListener(merged.slice());
     }).catch(function(e) {
@@ -847,18 +849,28 @@ window._ocSubscribeSnapshots = function(onUpdate, forced) {
     });
 
   } else {
-    /* ── COLD START: no cache — full getDocs once, then cache forever ── */
-    console.log('[Cache] Cold start — full Firestore history load (one-time)');
+    /* ── COLD START: no cache — fetch last 10 days only (not all history).
+       Older dates are loaded on-demand via the date picker when you
+       navigate to them — each fetched once, cached permanently.          */
+    var tenDaysAgoTs = todayTs - (10 * 24 * 60 * 60 * 1000);
+    console.log('[Cache] Cold start — fetching last 10 days only');
     var histQ = query(
       collection(db, 'oc_sessions'),
+      where('ts', '>=', tenDaysAgoTs),
       where('ts', '<', todayTs),
       orderBy('ts', 'desc')
     );
     getDocs(histQ).then(function(histSnap) {
       var allRows = [];
       histSnap.forEach(function(d){ allRows.push(d.data()); });
-      _saveHistCache(allRows, yesterdayEndTs);
-      console.log('[Cache] Cold start complete — ' + allRows.length + ' rows cached');
+      /* Build fetchedDates from the rows we just loaded */
+      var fdSet = {};
+      allRows.forEach(function(r){
+        if(r.date) fdSet[r.date] = true;
+      });
+      var fetchedDates = Object.keys(fdSet);
+      _saveHistCache(allRows, yesterdayEndTs, fetchedDates);
+      console.log('[Cache] Cold start complete — ' + allRows.length + ' rows (last 10 days), fetchedDates: ' + fetchedDates.length);
       attachLiveListener(allRows.slice());
     }).catch(function(e) {
       console.error('[Cache] Cold start failed:', e);
@@ -3735,8 +3747,73 @@ function updateHistoryDropdown(){
 }
 function onPickerDateChange(){
   var dateInput=document.getElementById('picker_date');
+  var isoDate=dateInput.value;
   var availDates=new Set();sessionLog.forEach(function(s){var iso=logDateToISO(s.date);if(iso)availDates.add(iso);});
-  populateTimePicker(dateInput.value,availDates);closeSnapshot();
+
+  /* On-demand fetch: if this date has no data in sessionLog and isn't
+     already cached, fetch it from Firestore now (one-time, ~375 reads max)
+     then merge into cache and re-render. Shows a loading note in the time
+     picker while fetching.                                               */
+  if(isoDate && !availDates.has(isoDate)) {
+    var cache = _loadHistCache();
+    var fd = (cache && cache.fetchedDates) ? cache.fetchedDates : [];
+    var alreadyFetched = fd.indexOf(isoDate) !== -1;
+
+    if(!alreadyFetched && window._ocCurrentUser && typeof db !== 'undefined') {
+      var timeInput = document.getElementById('picker_time');
+      if(timeInput) timeInput.innerHTML = '<option value="">⏳ Loading ' + isoDate + ' from Firestore…</option>';
+
+      /* Build timestamp range for the selected IST date */
+      var dayStartTs = new Date(isoDate + 'T00:00:00+05:30').getTime();
+      var dayEndTs   = new Date(isoDate + 'T23:59:59+05:30').getTime();
+
+      getDocs(query(
+        collection(db, 'oc_sessions'),
+        where('ts', '>=', dayStartTs),
+        where('ts', '<=', dayEndTs),
+        orderBy('ts', 'desc')
+      )).then(function(snap) {
+        var newRows = [];
+        snap.forEach(function(d){ newRows.push(d.data()); });
+        console.log('[Cache] On-demand fetch for ' + isoDate + ': ' + newRows.length + ' rows');
+
+        /* Merge into sessionLog and cache */
+        var existingCache = _loadHistCache();
+        var existingRows = existingCache ? existingCache.rows : [];
+        var mergedRows = newRows.concat(existingRows.filter(function(r){
+          /* drop any stale rows for this date before re-adding fresh ones */
+          return logDateToISO(r.date) !== isoDate;
+        }));
+        mergedRows.sort(function(a,b){ return (b.ts||0)-(a.ts||0); });
+
+        var newFd = fd.slice();
+        if(newFd.indexOf(isoDate) === -1) newFd.push(isoDate);
+        var cachedUpTo = existingCache ? existingCache.cachedUpTo : (dayStartTs - 1);
+        _saveHistCache(mergedRows, cachedUpTo, newFd);
+
+        /* Push into live sessionLog so the UI updates */
+        sessionLog = mergedRows;
+        renderLogTable(); updateHistoryDropdown();
+
+        /* Re-run picker population now that data is in */
+        var newAvail = new Set();
+        sessionLog.forEach(function(s){ var iso=logDateToISO(s.date); if(iso) newAvail.add(iso); });
+        populateTimePicker(isoDate, newAvail);
+
+        if(newRows.length === 0) {
+          if(timeInput) timeInput.innerHTML = '<option value="">— no data for ' + isoDate + ' —</option>';
+        }
+      }).catch(function(e){
+        console.warn('[Cache] On-demand fetch failed for ' + isoDate + ':', e);
+        if(timeInput) timeInput.innerHTML = '<option value="">— fetch failed, check connection —</option>';
+      });
+      return; /* wait for async fetch before populating time picker */
+    }
+    /* Already fetched before but still no data — genuinely no records */
+  }
+
+  populateTimePicker(isoDate, availDates);
+  closeSnapshot();
 }
 function populateTimePicker(isoDate,availDates){
   var timeInput=document.getElementById('picker_time');var viewBtn=document.getElementById('view_snap_btn');timeInput.innerHTML='';
