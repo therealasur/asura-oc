@@ -470,7 +470,7 @@ body.light .picker-input{color-scheme:light;}
 <!-- ══ FIREBASE ══ -->
 <script type="module">
 import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
-import { getFirestore, collection, getDocs, getDoc, onSnapshot, query, orderBy, where, doc, setDoc, deleteDoc, Timestamp, enableIndexedDbPersistence } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
+import { getFirestore, collection, getDocs, getDoc, onSnapshot, query, orderBy, where, doc, setDoc, deleteDoc, Timestamp, enableIndexedDbPersistence, limit } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
 import { getAuth, signInWithEmailAndPassword, signOut, onAuthStateChanged, sendSignInLinkToEmail, isSignInWithEmailLink, signInWithEmailLink } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
 
 const firebaseConfig = {
@@ -509,6 +509,7 @@ window.onSnapshot = onSnapshot;
 window.doc = doc;
 window.setDoc = setDoc;
 window.deleteDoc = deleteDoc;
+window.limit = limit;
 
 /* ── READ-QUOTA FIX (repeated-refresh bug) ─────────────────────────────
    Enables Firestore's OFFICIAL local IndexedDB cache. This does NOT change
@@ -1522,6 +1523,7 @@ console.log('OC Firebase Auth ready');
       <div class="picker-hint" id="picker_hint">No data yet — fetch during market hours to start logging.</div>
       <button class="logger-view-btn" onclick="viewSnapshot()" id="view_snap_btn" disabled>View Snapshot</button>
     </div>
+    <div class="picker-hint" id="global_oldest_hint" style="margin-top:4px;opacity:.85;"></div>
 
     <div class="history-panel" id="history_panel">
       <div class="history-banner"><div><span class="history-banner-label" id="history_banner_label">Snapshot</span><span class="history-banner-time" id="history_banner_time"></span></div><button class="history-close" onclick="closeSnapshot()">✕ Close</button></div>
@@ -1868,6 +1870,10 @@ function ocInitApp() {
 
   /* Load stored snapshots from Firestore (replaces old loadLog()) */
   ocLoadFromFirebase();
+
+  /* All-time oldest Firestore date — reads permanent cache, or queries
+     once if this is the first time this browser has ever checked. */
+  initGlobalOldest();
 }
 
 /* ── Firebase: load snapshots ── */
@@ -3926,6 +3932,86 @@ function updateHistoryDropdown(){
   hint.innerHTML='<span>'+count+' day'+(count!==1?'s':'')+' logged</span> · oldest: '+oldest+' · latest: '+newest;
   populateTimePicker(dateInput.value,availDates);
 }
+
+/* ── All-time oldest Firestore date ───────────────────────────────────
+   The "oldest:" text above is only ever the oldest date currently
+   LOADED into sessionLog (10-day rolling window + whatever's been
+   manually opened this session) — it is NOT the true earliest doc in
+   the whole 'oc_sessions' collection. This block answers that second
+   question separately: "what is the actual floor of my Firestore data,
+   even years from now, even if I've never touched that date?"
+
+   Firestore's earliest doc essentially never changes (it only moves if
+   old docs are deleted), so this queries orderBy('ts','asc') + limit(1)
+   exactly ONCE ever, caches the answer permanently in localStorage, and
+   never re-queries automatically. A manual ↻ recheck is provided for
+   the rare case old data actually gets pruned.                         */
+var GLOBAL_OLDEST_KEY='asura_oc_global_oldest_v1';
+
+function _loadGlobalOldestCache(){
+  try{
+    var raw=localStorage.getItem(GLOBAL_OLDEST_KEY);
+    if(!raw)return null;
+    var obj=JSON.parse(raw);
+    if(!obj||typeof obj.date==='undefined')return null;
+    return obj; /* { date:'YYYY-MM-DD'|'', fetchedAt } */
+  }catch(e){return null;}
+}
+function _saveGlobalOldestCache(isoDateOrEmpty){
+  try{ localStorage.setItem(GLOBAL_OLDEST_KEY, JSON.stringify({date:isoDateOrEmpty||'', fetchedAt:Date.now()})); }catch(e){}
+}
+
+/* One-time (or manual-recheck) Firestore query — 1 doc read, not a scan. */
+function _queryGlobalOldestFromFirestore(){
+  return getDocs(query(collection(db,'oc_sessions'), orderBy('ts','asc'), limit(1))).then(function(snap){
+    if(snap.empty)return '';
+    var d=null; snap.forEach(function(docSnap){ d=docSnap.data(); });
+    if(!d)return '';
+    return logDateToISO(d.date) || d.date || '';
+  });
+}
+
+function renderGlobalOldestHint(isoDate,isLoading){
+  var el=document.getElementById('global_oldest_hint');
+  if(!el)return;
+  var recheckBtn='<span onclick="recheckGlobalOldest()" title="Re-check Firestore (only needed if you deleted old data)" style="cursor:pointer;margin-left:6px;opacity:.7;">↻</span>';
+  if(isLoading){ el.innerHTML='🗄 All-time oldest (Firestore): <span style="opacity:.6;">checking…</span>'; return; }
+  if(!isoDate){ el.innerHTML='🗄 All-time oldest (Firestore): <span style="opacity:.6;">no data found</span>'+recheckBtn; return; }
+  el.innerHTML='🗄 All-time oldest (Firestore): <b>'+isoDate+'</b>'+recheckBtn;
+}
+
+/* Called once from ocInitApp — reads the permanent cache first, and only
+   ever hits Firestore if this browser/profile has never checked before. */
+function initGlobalOldest(){
+  var cached=_loadGlobalOldestCache();
+  if(cached){ renderGlobalOldestHint(cached.date||'',false); return; }
+  renderGlobalOldestHint(null,true);
+  _queryGlobalOldestFromFirestore().then(function(iso){
+    _saveGlobalOldestCache(iso);
+    renderGlobalOldestHint(iso,false);
+  }).catch(function(e){
+    console.warn('[GlobalOldest] initial query failed:',e);
+    renderGlobalOldestHint(null,false);
+  });
+}
+window.initGlobalOldest=initGlobalOldest;
+
+/* Manual override — forces a fresh Firestore query and overwrites the
+   permanent cache. Use this if you ever delete old snapshots and want
+   the displayed floor to reflect that. */
+function recheckGlobalOldest(){
+  renderGlobalOldestHint(null,true);
+  _queryGlobalOldestFromFirestore().then(function(iso){
+    _saveGlobalOldestCache(iso);
+    renderGlobalOldestHint(iso,false);
+    console.log('[GlobalOldest] Rechecked — true oldest is '+(iso||'(no data)'));
+  }).catch(function(e){
+    console.warn('[GlobalOldest] recheck failed:',e);
+    var cached=_loadGlobalOldestCache();
+    renderGlobalOldestHint(cached?cached.date:null,false);
+  });
+}
+window.recheckGlobalOldest=recheckGlobalOldest;
 function onPickerDateChange(){
   var dateInput=document.getElementById('picker_date');
   var isoDate=dateInput.value;
