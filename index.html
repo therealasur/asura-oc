@@ -486,6 +486,30 @@ const app  = initializeApp(firebaseConfig);
 const db   = getFirestore(app);
 const auth = getAuth(app);
 
+/* ── CROSS-SCRIPT SCOPE FIX ───────────────────────────────────────────
+   This script tag is `type="module"` — top-level const/function
+   declarations here are scoped to the module and are NOT visible to
+   the second, plain <script> block later in the file (onPickerDateChange
+   and friends live there). Classic scripts share the global `window`
+   object, so anything the classic script needs to call must be
+   explicitly attached to window from here. This was the actual root
+   cause of "picking a date does nothing" — onPickerDateChange was
+   calling db/query/collection/where/orderBy/getDocs/_loadHistCache by
+   bare name, all of which threw ReferenceError immediately, before any
+   fetch ever started. Confirmed via console: "Uncaught ReferenceError:
+   _loadHistCache is not defined at onPickerDateChange".              */
+window.db = db;
+window.query = query;
+window.collection = collection;
+window.where = where;
+window.orderBy = orderBy;
+window.getDocs = getDocs;
+window.getDoc = getDoc;
+window.onSnapshot = onSnapshot;
+window.doc = doc;
+window.setDoc = setDoc;
+window.deleteDoc = deleteDoc;
+
 /* ── READ-QUOTA FIX (repeated-refresh bug) ─────────────────────────────
    Enables Firestore's OFFICIAL local IndexedDB cache. This does NOT change
    any query, listener, or merge logic anywhere else in this file — same
@@ -740,6 +764,14 @@ function _saveHistCache(rows, cachedUpTo, fetchedDates) {
     } catch(e2) { console.warn('[Cache] Cache save failed:', e2); }
   }
 }
+
+/* Expose to window — these are called from the second, plain <script>
+   block (onPickerDateChange etc.), which cannot see module-scoped
+   function declarations. See the CROSS-SCRIPT SCOPE FIX note above. */
+window._archiveGet = _archiveGet;
+window._archivePut = _archivePut;
+window._loadHistCache = _loadHistCache;
+window._saveHistCache = _saveHistCache;
 
 /* ── Market-hours read gate ─────────────────────────────────────────────
    Outside 09:15–15:30 IST the dashboard serves everything from the local
