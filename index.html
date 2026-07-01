@@ -726,8 +726,51 @@ function _archivePut(isoDate, rows) {
       tx.oncomplete = function() { resolve(true); };
       tx.onerror    = function() { reject(tx.error); };
     });
+  }).then(function(ok) {
+    /* Keep the in-memory date set current so the "X days logged" hint
+       reflects this pick immediately, without re-reading IndexedDB.    */
+    if (ok && _archivedDateSet) _archivedDateSet.add(isoDate);
+    return ok;
   }).catch(function(e) { console.warn('[Archive] put failed for ' + isoDate + ':', e); return false; });
 }
+
+/* ── Permanent record of every manually-picked date ───────────────────
+   The picker hint ("X days logged · oldest…") only reflected sessionLog,
+   which resets to the rolling window on every reload — so a date you
+   fetched last month would drop back out the moment you refreshed, even
+   though it's still sitting in the IndexedDB archive from before. This
+   just reads the archive's key list (dates only, not the row data) once
+   at startup — a purely local IndexedDB read, 0 Firestore reads, doesn't
+   touch the 50k-read quota at all — and keeps it updated in memory as
+   you pick new dates. Uses getAllKeys() specifically (not getAll()) so
+   this stays cheap even after years of archived days — it never loads
+   the actual row data, just the date labels.
+   Trade-off: a date that was checked and confirmed to have ZERO snapshots
+   (e.g. you manually probed a market holiday) will still count toward
+   "days logged" here, since IndexedDB doesn't expose row-count without
+   reading the full record. Rare in practice and harmless either way. */
+var _archivedDateSet = null;
+
+function _loadArchivedDateSet() {
+  return _openArchiveDb().then(function(idb) {
+    return new Promise(function(resolve, reject) {
+      var tx  = idb.transaction(ARCHIVE_STORE, 'readonly');
+      var req = tx.objectStore(ARCHIVE_STORE).getAllKeys();
+      req.onsuccess = function() { resolve(req.result || []); };
+      req.onerror   = function() { reject(req.error); };
+    });
+  }).then(function(keys) {
+    _archivedDateSet = new Set(keys);
+    if (window._onArchivedDateSetLoaded) window._onArchivedDateSetLoaded();
+    return _archivedDateSet;
+  }).catch(function(e) {
+    console.warn('[Archive] Could not list archived dates:', e);
+    _archivedDateSet = _archivedDateSet || new Set();
+    return _archivedDateSet;
+  });
+}
+window._getArchivedDateSet = function() { return _archivedDateSet; };
+window._loadArchivedDateSet = _loadArchivedDateSet;
 
 /* Dev utility — call window._ocArchiveWipe() in console to clear the
    entire IndexedDB archive (forces every on-demand date to be
@@ -1934,6 +1977,12 @@ function ocInitApp() {
   /* All-time oldest Firestore date — reads permanent cache, or queries
      once if this is the first time this browser has ever checked. */
   initGlobalOldest();
+
+  /* Permanent "every date ever picked" set (IndexedDB keys, 0 Firestore
+     reads) — refreshes the "X days logged" hint once loaded so it no
+     longer resets to just the rolling window on every reload. */
+  window._onArchivedDateSetLoaded = function(){ updateHistoryDropdown(); };
+  if (window._loadArchivedDateSet) window._loadArchivedDateSet();
 }
 
 /* ── Firebase: load snapshots ── */
@@ -3981,6 +4030,11 @@ function updateHistoryDropdown(){
   if(!sessionLog.length){dateInput.disabled=true;timeInput.disabled=true;viewBtn.disabled=true;dateInput.value='';timeInput.innerHTML='<option value="">— pick a date first —</option>';hint.innerHTML='No data yet — fetch during market hours to start logging.';return;}
   var availDates=new Set();
   sessionLog.forEach(function(s){var iso=logDateToISO(s.date);if(iso)availDates.add(iso);});
+  /* Fold in every date ever manually picked (IndexedDB archive, 0 Firestore
+     reads) so "X days logged" survives reloads instead of resetting to
+     just the rolling window each time. */
+  var archived=window._getArchivedDateSet?window._getArchivedDateSet():null;
+  if(archived)archived.forEach(function(d){availDates.add(d);});
   var sorted=Array.from(availDates).sort();var oldest=sorted[0],newest=sorted[sorted.length-1];
   /* No min — allows selecting ANY past date so on-demand fetch triggers
      for dates older than the 10-day cold start window.
