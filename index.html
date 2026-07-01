@@ -645,6 +645,77 @@ window._ocUnsubscribeSnapshots = null;
 var HIST_CACHE_KEY = 'asura_hist_cache';
 var HIST_CACHE_VER = 3; /* v3: 10-day cold start + on-demand date loading */
 
+/* ── Long-term per-date archive (IndexedDB) ──────────────────────────
+   Scales to 100,000s of historical daily snapshots without hitting the
+   ~5-10MB localStorage ceiling that caused v3's silent eviction bug.
+   Each calendar date is its own IndexedDB record. The record's mere
+   EXISTENCE — even with an empty rows array — is the "already fetched"
+   signal. There is no separate ledger/flag array to fall out of sync
+   with the data (that mismatch was the root cause of dates getting
+   permanently stuck on "Loading…" after a localStorage quota trim).
+   An empty rows array means "checked Firestore, confirmed zero
+   snapshots that day" and is stored just as permanently as real data,
+   so a day with no data is never re-queried either.                  */
+var ARCHIVE_DB_NAME = 'asura_oc_archive';
+var ARCHIVE_DB_VERSION = 1;
+var ARCHIVE_STORE = 'daily_snapshots';
+var _archiveDbPromise = null;
+
+function _openArchiveDb() {
+  if (_archiveDbPromise) return _archiveDbPromise;
+  _archiveDbPromise = new Promise(function(resolve, reject) {
+    if (!('indexedDB' in window)) { reject(new Error('IndexedDB not supported')); return; }
+    var req = indexedDB.open(ARCHIVE_DB_NAME, ARCHIVE_DB_VERSION);
+    req.onupgradeneeded = function(e) {
+      var idb = e.target.result;
+      if (!idb.objectStoreNames.contains(ARCHIVE_STORE)) {
+        idb.createObjectStore(ARCHIVE_STORE, { keyPath: 'date' }); /* date = "YYYY-MM-DD" */
+      }
+    };
+    req.onsuccess = function(e) { resolve(e.target.result); };
+    req.onerror   = function(e) { reject(e.target.error); };
+  });
+  return _archiveDbPromise;
+}
+
+/* Resolves { date, rows, fetchedAt } if this date has ever been archived
+   (including a confirmed-empty day), or null if it has never been checked. */
+function _archiveGet(isoDate) {
+  return _openArchiveDb().then(function(idb) {
+    return new Promise(function(resolve, reject) {
+      var tx  = idb.transaction(ARCHIVE_STORE, 'readonly');
+      var req = tx.objectStore(ARCHIVE_STORE).get(isoDate);
+      req.onsuccess = function() { resolve(req.result || null); };
+      req.onerror   = function() { reject(req.error); };
+    });
+  }).catch(function(e) { console.warn('[Archive] get failed for ' + isoDate + ':', e); return null; });
+}
+
+/* Archives rows for one date permanently — rows can be an empty array,
+   which is itself a valid, permanent "no data this day" record.        */
+function _archivePut(isoDate, rows) {
+  return _openArchiveDb().then(function(idb) {
+    return new Promise(function(resolve, reject) {
+      var tx = idb.transaction(ARCHIVE_STORE, 'readwrite');
+      tx.objectStore(ARCHIVE_STORE).put({ date: isoDate, rows: rows, fetchedAt: Date.now() });
+      tx.oncomplete = function() { resolve(true); };
+      tx.onerror    = function() { reject(tx.error); };
+    });
+  }).catch(function(e) { console.warn('[Archive] put failed for ' + isoDate + ':', e); return false; });
+}
+
+/* Dev utility — call window._ocArchiveWipe() in console to clear the
+   entire IndexedDB archive (forces every on-demand date to be
+   re-fetched from Firestore on next selection). Use sparingly — this
+   is the thing that's supposed to keep you under the 50k read limit. */
+window._ocArchiveWipe = function() {
+  try {
+    indexedDB.deleteDatabase(ARCHIVE_DB_NAME);
+    _archiveDbPromise = null;
+    console.log('[Archive] Wiped. Every on-demand date will re-fetch from Firestore next time it is selected.');
+  } catch(e) { console.warn('[Archive] Wipe failed:', e); }
+};
+
 function _loadHistCache() {
   try {
     var raw = localStorage.getItem(HIST_CACHE_KEY);
@@ -1563,6 +1634,17 @@ var lastExpirFetch = {};   /* timestamp of last expiry fetch per inst */
 var expiryCache = {};
 var manualExpiry = false;
 var sessionLog = [];
+/* ── Historical-date "pin" state ────────────────────────────────────
+   sessionLog is what's rendered. _liveRollingRows is the raw rolling
+   10-day window as it comes from the live Firestore listener — kept
+   separate so a pinned archived date isn't wiped out on the next live
+   tick. When _pinnedDate is set, sessionLog = pinned rows + rolling
+   rows (minus the pinned date to avoid dupes), rebuilt on every live
+   update so the rolling window still stays fresh in the background
+   while the pinned day stays visible.                                */
+var _liveRollingRows = [];
+var _pinnedDate = null;
+var _pinnedRows = [];
 var _fbSaveTimer = null;
 var lastRenderedData = {};
 /* ── Invert bias state ── */
@@ -1963,7 +2045,18 @@ function ocLoadFromFirebase() {
          force a re-subscribe (bypassing the market-hours gate) without
          losing the original handler reference. */
       var _onUpdate = function(rows) {
-        sessionLog = rows || [];
+        _liveRollingRows = rows || [];
+        if (_pinnedDate) {
+          /* A historical date is pinned — keep it visible, splice the
+             fresh rolling-window rows in behind it instead of replacing
+             the view outright. */
+          sessionLog = _pinnedRows.concat(_liveRollingRows.filter(function(r){
+            return logDateToISO(r.date) !== _pinnedDate;
+          }));
+          sessionLog.sort(function(a,b){ return (b.ts||0)-(a.ts||0); });
+        } else {
+          sessionLog = _liveRollingRows.slice();
+        }
         normalizeSessionLogBias();
         if(loadEl) loadEl.style.display = 'none';
         if(firstLoad) {
@@ -3804,22 +3897,61 @@ function updateHistoryDropdown(){
 function onPickerDateChange(){
   var dateInput=document.getElementById('picker_date');
   var isoDate=dateInput.value;
-  var availDates=new Set();sessionLog.forEach(function(s){var iso=logDateToISO(s.date);if(iso)availDates.add(iso);});
 
-  /* On-demand fetch: if this date has no data in sessionLog and isn't
-     already cached, fetch it from Firestore now (one-time, ~375 reads max)
-     then merge into cache and re-render. Shows a loading note in the time
-     picker while fetching.                                               */
-  if(isoDate && !availDates.has(isoDate)) {
-    var cache = _loadHistCache();
-    var fd = (cache && cache.fetchedDates) ? cache.fetchedDates : [];
-    var alreadyFetched = fd.indexOf(isoDate) !== -1;
+  /* rollingDates = what's actually in the live 10-day window right now,
+     independent of whether a historical date happens to be pinned on
+     top of it. Used to decide: is this a "go back to live" selection? */
+  var rollingDates=new Set();
+  _liveRollingRows.forEach(function(s){var iso=logDateToISO(s.date);if(iso)rollingDates.add(iso);});
 
-    if(!alreadyFetched && window._ocCurrentUser && typeof db !== 'undefined') {
-      var timeInput = document.getElementById('picker_time');
+  if (isoDate && rollingDates.has(isoDate)) {
+    /* User picked a date that's in the live rolling window — unpin
+       (if anything was pinned) and go back to the pure live view. */
+    if (_pinnedDate) { _pinnedDate = null; _pinnedRows = []; }
+    sessionLog = _liveRollingRows.slice();
+    var avail1 = new Set(); sessionLog.forEach(function(s){var iso=logDateToISO(s.date);if(iso)avail1.add(iso);});
+    populateTimePicker(isoDate, avail1);
+    closeSnapshot();
+    return;
+  }
+
+  if (isoDate && isoDate === _pinnedDate) {
+    /* Already pinned and displayed — nothing to fetch, just re-show it. */
+    var avail2 = new Set(); sessionLog.forEach(function(s){var iso=logDateToISO(s.date);if(iso)avail2.add(iso);});
+    populateTimePicker(isoDate, avail2);
+    closeSnapshot();
+    return;
+  }
+
+  /* On-demand fetch, backed by the IndexedDB archive:
+       1. Date already archived (real rows OR a confirmed-empty record)?
+          Load straight from IndexedDB — 0 Firestore reads, every time,
+          forever. This is the "select same day again → loads from
+          cache" behaviour.
+       2. Never archived before? One Firestore query for that single day,
+          then permanently archive the result (even if empty) so it is
+          never queried again.
+     Either way the date gets pinned so it survives live ticks.          */
+  if (isoDate) {
+    if (!(window._ocCurrentUser && typeof db !== 'undefined')) {
+      var availF = new Set(); sessionLog.forEach(function(s){var iso=logDateToISO(s.date);if(iso)availF.add(iso);});
+      populateTimePicker(isoDate, availF);
+      closeSnapshot();
+      return;
+    }
+
+    var timeInput = document.getElementById('picker_time');
+    if(timeInput) timeInput.innerHTML = '<option value="">⏳ Checking local archive…</option>';
+
+    _archiveGet(isoDate).then(function(archived) {
+      if (archived) {
+        console.log('[Archive] ' + isoDate + ' loaded from IndexedDB — 0 Firestore reads (' + archived.rows.length + ' rows)');
+        _mergeArchivedRows(isoDate, archived.rows);
+        return;
+      }
+
+      /* Never archived — one Firestore read for this specific day */
       if(timeInput) timeInput.innerHTML = '<option value="">⏳ Loading ' + isoDate + ' from Firestore…</option>';
-
-      /* Build timestamp range for the selected IST date */
       var dayStartTs = new Date(isoDate + 'T00:00:00+05:30').getTime();
       var dayEndTs   = new Date(isoDate + 'T23:59:59+05:30').getTime();
 
@@ -3831,45 +3963,46 @@ function onPickerDateChange(){
       )).then(function(snap) {
         var newRows = [];
         snap.forEach(function(d){ newRows.push(d.data()); });
-        console.log('[Cache] On-demand fetch for ' + isoDate + ': ' + newRows.length + ' rows');
+        console.log('[Archive] On-demand Firestore fetch for ' + isoDate + ': ' + newRows.length + ' rows — archiving to IndexedDB permanently');
 
-        /* Merge into sessionLog and cache */
-        var existingCache = _loadHistCache();
-        var existingRows = existingCache ? existingCache.rows : [];
-        var mergedRows = newRows.concat(existingRows.filter(function(r){
-          /* drop any stale rows for this date before re-adding fresh ones */
-          return logDateToISO(r.date) !== isoDate;
-        }));
-        mergedRows.sort(function(a,b){ return (b.ts||0)-(a.ts||0); });
-
-        var newFd = fd.slice();
-        if(newFd.indexOf(isoDate) === -1) newFd.push(isoDate);
-        var cachedUpTo = existingCache ? existingCache.cachedUpTo : (dayStartTs - 1);
-        _saveHistCache(mergedRows, cachedUpTo, newFd);
-
-        /* Push into live sessionLog so the UI updates */
-        sessionLog = mergedRows;
-        renderLogTable(); updateHistoryDropdown();
-
-        /* Re-run picker population now that data is in */
-        var newAvail = new Set();
-        sessionLog.forEach(function(s){ var iso=logDateToISO(s.date); if(iso) newAvail.add(iso); });
-        populateTimePicker(isoDate, newAvail);
-
-        if(newRows.length === 0) {
-          if(timeInput) timeInput.innerHTML = '<option value="">— no data for ' + isoDate + ' —</option>';
-        }
+        _archivePut(isoDate, newRows).then(function() {
+          _mergeArchivedRows(isoDate, newRows);
+        });
       }).catch(function(e){
-        console.warn('[Cache] On-demand fetch failed for ' + isoDate + ':', e);
+        console.warn('[Archive] Firestore fetch failed for ' + isoDate + ':', e);
         if(timeInput) timeInput.innerHTML = '<option value="">— fetch failed, check connection —</option>';
       });
-      return; /* wait for async fetch before populating time picker */
-    }
-    /* Already fetched before but still no data — genuinely no records */
+    });
+    return; /* wait for async archive check / fetch before populating time picker */
   }
 
+  var availDates=new Set(); sessionLog.forEach(function(s){var iso=logDateToISO(s.date);if(iso)availDates.add(iso);});
   populateTimePicker(isoDate, availDates);
   closeSnapshot();
+}
+
+/* Merges archived/fetched rows for one date into the live view AND
+   pins that date so subsequent live listener ticks (during market
+   hours) don't wipe it back out — see _onUpdate's pin-aware merge. */
+function _mergeArchivedRows(isoDate, rows) {
+  _pinnedDate = isoDate;
+  _pinnedRows = rows;
+
+  sessionLog = _pinnedRows.concat(_liveRollingRows.filter(function(r){
+    return logDateToISO(r.date) !== isoDate;
+  }));
+  sessionLog.sort(function(a,b){ return (b.ts||0)-(a.ts||0); });
+
+  renderLogTable(); updateHistoryDropdown();
+
+  var newAvail = new Set();
+  sessionLog.forEach(function(s){ var iso=logDateToISO(s.date); if(iso) newAvail.add(iso); });
+  populateTimePicker(isoDate, newAvail);
+
+  if (rows.length === 0) {
+    var timeInput = document.getElementById('picker_time');
+    if(timeInput) timeInput.innerHTML = '<option value="">— no data for ' + isoDate + ' —</option>';
+  }
 }
 function populateTimePicker(isoDate,availDates){
   var timeInput=document.getElementById('picker_time');var viewBtn=document.getElementById('view_snap_btn');timeInput.innerHTML='';
