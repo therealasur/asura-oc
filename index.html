@@ -1000,6 +1000,66 @@ window._ocBustCache = function() {
   console.log("[Cache] History cache cleared. Reload the page to re-fetch from Firestore.");
 };
 
+/* ── One-off repair: docs with a broken ts field ─────────────────────
+   Some docs (traced to the CSV bulk-importer) got written with ts:0
+   instead of a real epoch-ms value. Anything trusting ts for ordering
+   or range queries (delta-fetch, the all-time-oldest lookup, etc.)
+   silently mishandles these. This recomputes ts the same way the
+   worker does — date + time, interpreted in Asia/Kolkata (+05:30) —
+   and patches ONLY the ts field, leaving everything else untouched.
+
+   Usage (console):
+     window._ocRepairTs()        → DRY RUN, logs what it WOULD fix, writes nothing
+     window._ocRepairTs(false)   → actually patches the broken docs
+*/
+function _computeTsFromDateTime(dateStr, timeStr) {
+  var iso = window.logDateToISO ? window.logDateToISO(dateStr) : null;
+  if (!iso || !timeStr) return null;
+  var s = String(timeStr).trim().toLowerCase();
+  var isPM = s.indexOf('pm') !== -1, isAM = s.indexOf('am') !== -1;
+  s = s.replace(/[apm\s]/g, '');
+  var parts = s.split(':');
+  var h = parseInt(parts[0] || '0', 10);
+  var mi = parseInt(parts[1] || '0', 10);
+  var se = parseInt(parts[2] || '0', 10);
+  if (isNaN(h) || isNaN(mi)) return null;
+  if (isPM && h < 12) h += 12;
+  if (isAM && h === 12) h = 0;
+  var hhmmss = String(h).padStart(2,'0') + ':' + String(mi).padStart(2,'0') + ':' + String(se||0).padStart(2,'0');
+  var t = new Date(iso + 'T' + hhmmss + '+05:30').getTime();
+  return isNaN(t) ? null : t;
+}
+
+window._ocRepairTs = async function(dryRun) {
+  if (dryRun === undefined) dryRun = true;
+  console.log('[RepairTs] Scanning oc_sessions for docs with missing/zero ts \u2014 dryRun=' + dryRun);
+  var snap = await getDocs(collection(db, 'oc_sessions'));
+  var toFix = [], unparseable = [];
+  snap.forEach(function(docSnap) {
+    var d = docSnap.data();
+    if (!d.ts) {
+      var newTs = _computeTsFromDateTime(d.date, d.time);
+      if (newTs) toFix.push({ id: docSnap.id, date: d.date, time: d.time, oldTs: d.ts || 0, newTs: newTs });
+      else unparseable.push({ id: docSnap.id, date: d.date, time: d.time });
+    }
+  });
+  console.log('[RepairTs] Scanned ' + snap.size + ' docs. Fixable: ' + toFix.length + '. Unparseable (needs manual look): ' + unparseable.length + '.');
+  if (toFix.length) console.table(toFix.slice(0, 25));
+  if (unparseable.length) { console.warn('[RepairTs] Could not parse date/time for these — skipped:'); console.table(unparseable); }
+  if (dryRun) {
+    console.log('[RepairTs] DRY RUN only \u2014 nothing written. Run window._ocRepairTs(false) to patch these ' + toFix.length + ' docs.');
+    return { wouldFix: toFix.length, unparseable: unparseable.length };
+  }
+  console.log('[RepairTs] Writing fixes for ' + toFix.length + ' docs...');
+  var done = 0, failed = 0;
+  for (var i = 0; i < toFix.length; i++) {
+    try { await setDoc(doc(db, 'oc_sessions', toFix[i].id), { ts: toFix[i].newTs }, { merge: true }); done++; }
+    catch(e) { failed++; console.error('[RepairTs] Failed on ' + toFix[i].id + ':', e); }
+  }
+  console.log('[RepairTs] Done \u2014 patched ' + done + ', failed ' + failed + '.');
+  return { patched: done, failed: failed };
+};
+
 window._ocSaveSettings = async function(token, clientId, selectedInst, selectedExpiry) {
   if (!window._ocCurrentUser) return;
   try {
@@ -3963,7 +4023,11 @@ function _saveGlobalOldestCache(isoDateOrEmpty){
 
 /* One-time (or manual-recheck) Firestore query — 1 doc read, not a scan. */
 function _queryGlobalOldestFromFirestore(){
-  return getDocs(query(collection(db,'oc_sessions'), orderBy('ts','asc'), limit(1))).then(function(snap){
+  /* ts:0 (epoch/unset) shows up on a batch of docs — almost certainly from
+     a bulk-import path that never set ts. orderBy('ts','asc') would treat
+     those as "oldest" even though their real `date` field is recent, so
+     they're explicitly excluded here.                                   */
+  return getDocs(query(collection(db,'oc_sessions'), where('ts','>',0), orderBy('ts','asc'), limit(1))).then(function(snap){
     if(snap.empty)return '';
     var d=null; snap.forEach(function(docSnap){ d=docSnap.data(); });
     if(!d)return '';
