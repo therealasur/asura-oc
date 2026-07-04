@@ -1,1 +1,461 @@
 
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ASURA — ABMD Repair Tool (Standalone)</title>
+<style>
+  :root{
+    --bg:#0c0c0e;--bg2:#141416;--bg3:#1c1c1f;--bg4:#242428;
+    --border:rgba(255,255,255,0.08);--border2:rgba(255,255,255,0.14);
+    --text:#f2f2f4;--text2:#a8a8b3;--text3:#5c5c6e;
+    --red:#f04545;--red-bg:rgba(240,69,69,0.10);--red-border:rgba(240,69,69,0.25);
+    --green:#2ecc88;--green-bg:rgba(46,204,136,0.10);--green-border:rgba(46,204,136,0.25);
+    --teal:#00c9a0;--teal-bg:rgba(0,201,160,0.10);--teal-border:rgba(0,201,160,0.25);
+    --orange:#f09030;--orange-bg:rgba(240,144,48,0.10);--orange-border:rgba(240,144,48,0.25);
+    --radius:12px;--radius-sm:8px;
+  }
+  *{box-sizing:border-box;margin:0;padding:0;}
+  body{background:var(--bg);color:var(--text);font-family:'Inter',system-ui,sans-serif;font-size:14px;line-height:1.6;min-height:100vh;padding:24px;}
+  .wrap{max-width:900px;margin:0 auto;}
+  h1{font-size:20px;font-weight:700;background:linear-gradient(135deg,var(--teal),#4d9fff);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;margin-bottom:4px;}
+  .sub{font-size:11px;color:var(--text3);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:20px;}
+  .warn-banner{background:var(--orange-bg);border:1px solid var(--orange-border);border-radius:var(--radius-sm);padding:12px 16px;font-size:12px;color:var(--text2);margin-bottom:20px;line-height:1.6;}
+  .warn-banner b{color:var(--orange);}
+  .card{background:var(--bg2);border:1px solid var(--border2);border-radius:var(--radius);padding:20px 22px;margin-bottom:18px;}
+  .card-title{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.8px;color:var(--text3);margin-bottom:14px;}
+  #auth_section .status-row{display:flex;align-items:center;gap:10px;margin-bottom:14px;}
+  .dot{width:8px;height:8px;border-radius:50%;background:var(--text3);flex-shrink:0;}
+  .dot.ok{background:var(--green);}
+  .dot.err{background:var(--red);}
+  .btn{padding:10px 22px;border-radius:var(--radius-sm);border:none;font-size:13px;font-weight:600;cursor:pointer;font-family:inherit;transition:opacity 0.15s;}
+  .btn-primary{background:linear-gradient(135deg,var(--teal),#4d9fff);color:#fff;}
+  .btn-primary:hover{opacity:0.88;}
+  .btn-secondary{background:var(--bg3);border:1px solid var(--border2);color:var(--text2);}
+  .btn-secondary:hover{background:var(--bg4);color:var(--text);}
+  .btn:disabled{opacity:0.35;cursor:not-allowed;}
+  .btn-danger{background:var(--red);color:#fff;}
+  .field{display:flex;flex-direction:column;gap:5px;margin-bottom:14px;}
+  .field label{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.4px;color:var(--text3);}
+  .field input,.field select{padding:9px 12px;background:var(--bg3);border:1px solid var(--border2);border-radius:var(--radius-sm);color:var(--text);font-size:13px;font-family:inherit;color-scheme:dark;}
+  .field input:focus,.field select:focus{outline:none;border-color:var(--teal);}
+  .row{display:flex;gap:14px;flex-wrap:wrap;}
+  .row > .field{flex:1;min-width:160px;}
+  .actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:6px;}
+  .hint{font-size:11px;color:var(--text3);margin-top:6px;line-height:1.5;}
+  #log_output{margin-top:16px;background:var(--bg3);border:1px solid var(--border2);border-radius:var(--radius-sm);padding:12px 14px;font-family:'JetBrains Mono',monospace;font-size:11px;max-height:340px;overflow-y:auto;white-space:pre-wrap;line-height:1.7;display:none;}
+  .line-ok{color:var(--green);}
+  .line-warn{color:var(--orange);}
+  .line-err{color:var(--red);font-weight:600;}
+  .line-info{color:var(--text2);}
+  table.preview{width:100%;border-collapse:collapse;margin-top:12px;font-size:11px;}
+  table.preview th{text-align:left;padding:6px 10px;background:var(--bg4);color:var(--text3);font-size:9px;text-transform:uppercase;letter-spacing:0.5px;border-bottom:1px solid var(--border2);}
+  table.preview td{padding:6px 10px;border-bottom:1px solid var(--border);color:var(--text2);font-family:'JetBrains Mono',monospace;}
+  table.preview tr.changed td{background:rgba(240,144,48,0.06);}
+  .badge{display:inline-flex;padding:2px 8px;border-radius:10px;font-size:9px;font-weight:700;letter-spacing:0.3px;}
+  .badge-raw{background:var(--blue-bg,rgba(77,159,255,0.1));color:#4d9fff;}
+  .badge-smart{background:var(--orange-bg);color:var(--orange);}
+  .badge-none{background:var(--bg4);color:var(--text3);}
+  #summary_line{font-size:13px;font-weight:600;margin-top:10px;}
+  .hidden{display:none;}
+  a{color:var(--teal);}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>🩹 ASURA — ABMD Repair Tool</h1>
+  <div class="sub">Standalone · Not part of the OC Dashboard Worker · Run only when needed</div>
+
+  <div class="warn-banner">
+    <b>What this does:</b> recomputes <code>autoBiasMode</code>, <code>rawType</code>, <code>followBias</code>, <code>trailingHigh/Low</code>
+    for a chosen date+instrument from the raw preserved fields already sitting in Firestore
+    (<code>netCeChg</code>, <code>netPeChg</code>, <code>candleHigh</code>, <code>candleLow</code>, <code>spot</code>) — using the current,
+    fixed exit logic — and overwrites just those derived fields. It never touches <code>worker_fixed.js</code>
+    or any other part of your live dashboard. Always run a <b>dry run</b> first.
+  </div>
+
+  <div class="card" id="auth_section">
+    <div class="card-title">Step 1 — Sign In</div>
+    <div class="status-row">
+      <span class="dot" id="auth_dot"></span>
+      <span id="auth_status">Not signed in</span>
+    </div>
+    <div class="actions">
+      <button class="btn btn-primary" id="signin_btn" onclick="doSignIn()">Sign in with Google</button>
+      <button class="btn btn-secondary hidden" id="signout_btn" onclick="doSignOut()">Sign out</button>
+    </div>
+    <div class="hint">Uses the same Firebase project as the OC Dashboard (asura-journal). Firestore Security Rules require a signed-in user — this is the same account you already use.</div>
+  </div>
+
+  <div class="card hidden" id="repair_section">
+    <div class="card-title">Step 2 — Select Date &amp; Instrument</div>
+    <div class="row">
+      <div class="field">
+        <label>Date</label>
+        <input type="date" id="repair_date">
+      </div>
+      <div class="field">
+        <label>Instrument</label>
+        <select id="repair_inst">
+          <option value="nifty">NIFTY 50</option>
+          <option value="sensex">SENSEX</option>
+        </select>
+      </div>
+    </div>
+    <div class="actions">
+      <button class="btn btn-secondary" id="dryrun_btn" onclick="runRepair(true)">🔍 Dry Run (preview only)</button>
+      <button class="btn btn-danger" id="apply_btn" onclick="confirmApply()" disabled>⚠️ Apply Fix (writes to Firestore)</button>
+    </div>
+    <div class="hint">Dry run shows exactly what would change without writing anything. Apply is only enabled after a dry run has completed for the same date+instrument.</div>
+    <div id="summary_line"></div>
+    <div id="preview_wrap"></div>
+  </div>
+
+  <div class="card" id="log_section">
+    <div class="card-title">Log <button class="btn btn-secondary" style="float:right;padding:3px 10px;font-size:10px;" onclick="toggleLog()">Toggle</button></div>
+    <div id="log_output"></div>
+  </div>
+</div>
+
+<script type="module">
+import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
+import { getFirestore, collection, query, where, getDocs, doc, setDoc } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
+import { getAuth, GoogleAuthProvider, signInWithPopup, signOut, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
+
+/* ── Same Firebase project as the OC Dashboard — read-only credential, no admin secrets ── */
+const firebaseConfig = {
+  apiKey: "AIzaSyDDu28DwdZvkW36GeiYCu62msVzVxIl7uE",
+  authDomain: "asura-journal.firebaseapp.com",
+  projectId: "asura-journal",
+  storageBucket: "asura-journal.firebasestorage.app",
+  messagingSenderId: "966813748628",
+  appId: "1:966813748628:web:6d00081f803d59b81d5381"
+};
+
+const app = initializeApp(firebaseConfig);
+const db = getFirestore(app);
+const auth = getAuth(app);
+const provider = new GoogleAuthProvider();
+
+window.doSignIn = async function(){
+  try{
+    await signInWithPopup(auth, provider);
+  }catch(e){
+    logLine('Sign-in failed: ' + e.message, 'err');
+  }
+};
+window.doSignOut = async function(){
+  try{ await signOut(auth); }catch(e){}
+};
+
+onAuthStateChanged(auth, (user) => {
+  const dot = document.getElementById('auth_dot');
+  const status = document.getElementById('auth_status');
+  const signinBtn = document.getElementById('signin_btn');
+  const signoutBtn = document.getElementById('signout_btn');
+  const repairSection = document.getElementById('repair_section');
+  if(user){
+    dot.className = 'dot ok';
+    status.textContent = 'Signed in as ' + (user.email || user.uid);
+    signinBtn.classList.add('hidden');
+    signoutBtn.classList.remove('hidden');
+    repairSection.classList.remove('hidden');
+  } else {
+    dot.className = 'dot';
+    status.textContent = 'Not signed in';
+    signinBtn.classList.remove('hidden');
+    signoutBtn.classList.add('hidden');
+    repairSection.classList.add('hidden');
+  }
+});
+
+/* ══════════════════════════════════════════════════════════════
+   COMPUTE AUTO BIAS MODE — copied verbatim from the dashboard's
+   computeAutoBiasMode() (worker_fixed.js embedded DASHBOARD_HTML_B64,
+   v5.0 OHLC exit + v8.2 single-trigger fix). KEEP IN SYNC MANUALLY
+   if the main dashboard's ABMD logic changes in the future — this
+   standalone tool has its own copy so it never depends on the
+   dashboard being open.
+   ══════════════════════════════════════════════════════════════ */
+var FC_PCT_THRESHOLD  = 7/200;   /* 3.5% */
+var FC_SPOT_ENTRY_PCT = 0.00125;
+var FC_SPOT_EXIT_PCT  = 0.00250;
+var abmdLiveRun = false; /* never fire sound alerts from this tool */
+
+function log(msg, level){ logLine(msg, level || 'info'); }
+function fireSoundAlert(){ /* no-op in standalone tool */ }
+
+function timeToMinutes(tStr){
+  if(!tStr) return 0;
+  var s = tStr.trim().toLowerCase();
+  var isPM = s.indexOf('pm') !== -1;
+  var isAM = s.indexOf('am') !== -1;
+  s = s.replace(/[apm\s]/g,'');
+  var p = s.split(':');
+  var h = parseInt(p[0]||0), m = parseInt(p[1]||0);
+  if(isPM && h < 12) h += 12;
+  if(isAM && h === 12) h = 0;
+  return h*60 + m;
+}
+
+function computeAutoBiasMode(pts) {
+  if(!pts || pts.length < 2) return;
+
+  var inRaw = false;
+  var rawType = null;
+  var trailingHigh = 0;
+  var trailingLow  = 0;
+  var triggerOverallBias = null, triggerRawBias = null;
+
+  function dirOf(b){ b=(b||'').toUpperCase(); return b.indexOf('BULL')>=0?'BULL':b.indexOf('BEAR')>=0?'BEAR':'OTHER'; }
+  function decideFollow(triggerOverall, triggerRaw, rawTypeVal){
+    var exp = rawTypeVal==='bear' ? 'BEAR' : 'BULL';
+    var ovMatch  = dirOf(triggerOverall) === exp;
+    var rawMatch = dirOf(triggerRaw)     === exp;
+    if(ovMatch && rawMatch)  return 'overall';
+    if(ovMatch && !rawMatch) return 'overall';
+    if(!ovMatch && rawMatch) return 'raw';
+    return 'mixed';
+  }
+
+  for(var i = 0; i < pts.length; i++) {
+    var p = pts[i];
+    var spot = parseFloat(p.spot) || 0;
+
+    var PEAK_WINDOW = 10;
+    var rollingHigh = spot, rollingLow = spot;
+    for(var k = Math.max(0, i - PEAK_WINDOW); k < i; k++) {
+      var ps = parseFloat(pts[k].spot) || 0;
+      if(ps > rollingHigh) rollingHigh = ps;
+      if(ps < rollingLow) rollingLow = ps;
+    }
+    var spotDropFromPeak  = rollingHigh - spot;
+    var spotRiseFromTrough = spot - rollingLow;
+
+    var fcSpotEntry = spot > 0 ? spot * FC_SPOT_ENTRY_PCT : 30;
+    var fcSpotExit  = spot > 0 ? spot * FC_SPOT_EXIT_PCT  : 60;
+
+    var peChgVsPrev = i > 0 ? (p.netPeChgRaw - pts[i-1].netPeChgRaw) : 0;
+    var netCeChgRaw = p.netCeChgRaw || 0;
+    var prevCeChgRaw = (i > 0 && pts[i-1].netCeChgRaw) ? pts[i-1].netCeChgRaw : 0;
+    var ceChgVsPrev = i > 0 ? (netCeChgRaw - prevCeChgRaw) : 0;
+
+    p.fcTrigger = false;
+    p.fuTrigger = false;
+
+    if(!inRaw) {
+      var prevPeOI = i > 0 ? Math.abs(pts[i-1].netPeChgRaw) : 0;
+      var prevCeOI = i > 0 ? Math.abs(pts[i-1].netCeChgRaw) : 0;
+      var peOIFloor  = Math.max(prevPeOI, 1000000);
+      var ceOIFloor  = Math.max(prevCeOI, 1000000);
+      var peDropPct  = peChgVsPrev < 0 ? (-peChgVsPrev / peOIFloor) : 0;
+      var ceDropPct  = ceChgVsPrev < 0 ? (-ceChgVsPrev / ceOIFloor) : 0;
+
+      if(peDropPct >= FC_PCT_THRESHOLD && spotDropFromPeak >= fcSpotEntry) {
+        inRaw = true;
+        rawType = 'bear';
+        trailingLow  = spot;
+        trailingHigh = 0;
+        p.fcTrigger = true;
+        triggerOverallBias = p.bias || '—';
+        triggerRawBias     = p.rawBias || '—';
+        log('BEARISH FC at ' + p.time + ' PE Δ=' + (peChgVsPrev/1000).toFixed(0) + 'K', 'warn');
+      }
+      else if(ceDropPct >= FC_PCT_THRESHOLD && spotRiseFromTrough >= fcSpotEntry) {
+        inRaw = true;
+        rawType = 'bull';
+        trailingHigh = spot;
+        trailingLow  = 0;
+        p.fuTrigger = true;
+        triggerOverallBias = p.bias || '—';
+        triggerRawBias     = p.rawBias || '—';
+        log('BULLISH FU at ' + p.time + ' CE Δ=' + (ceChgVsPrev/1000).toFixed(0) + 'K', 'warn');
+      }
+    } else {
+      if(rawType === 'bull') {
+        if(spot > trailingHigh) trailingHigh = spot;
+        if(p.candleHigh != null && p.candleHigh > trailingHigh) trailingHigh = p.candleHigh;
+      } else if(rawType === 'bear') {
+        if(spot < trailingLow || trailingLow === 0) trailingLow = spot;
+        if(p.candleLow != null && (trailingLow === 0 || p.candleLow < trailingLow)) trailingLow = p.candleLow;
+      }
+
+      var recovered = false;
+      var nextPt = (i + 1 < pts.length) ? pts[i + 1] : null;
+      if(rawType === 'bear') {
+        var bearExitLevel = trailingLow + fcSpotExit;
+        if(spot >= bearExitLevel) recovered = true;
+        if(!recovered && p.candleHigh != null && p.candleHigh >= bearExitLevel) recovered = true;
+        if(!recovered && nextPt && nextPt.candleHigh != null && nextPt.candleHigh >= bearExitLevel) recovered = true;
+      } else if(rawType === 'bull') {
+        var bullExitLevel = trailingHigh - fcSpotExit;
+        if(spot <= bullExitLevel) recovered = true;
+        if(!recovered && p.candleLow != null && p.candleLow <= bullExitLevel) recovered = true;
+        if(!recovered && nextPt && nextPt.candleLow != null && nextPt.candleLow <= bullExitLevel) recovered = true;
+      }
+
+      if(recovered) {
+        p.exitFired = true;
+      }
+    }
+
+    pts[i].biasMode = inRaw ? 'raw' : 'smart';
+    pts[i].rawType = rawType;
+    pts[i].trailingHigh = trailingHigh;
+    pts[i].trailingLow  = trailingLow;
+    pts[i].followBias = inRaw ? decideFollow(triggerOverallBias, triggerRawBias, rawType) : null;
+
+    if(recovered) {
+      inRaw = false;
+      rawType = null;
+      trailingHigh = 0;
+      trailingLow  = 0;
+      triggerOverallBias = null;
+      triggerRawBias = null;
+    }
+  }
+}
+
+/* ── UI wiring ── */
+var lastDryRunResult = null; /* { dateStr, inst, pts } — gates Apply button */
+
+function logLine(msg, level){
+  var el = document.getElementById('log_output');
+  el.style.display = 'block';
+  var ts = new Date().toLocaleTimeString('en-IN', {timeZone:'Asia/Kolkata', hour12:false});
+  var cls = level === 'err' ? 'line-err' : level === 'warn' ? 'line-warn' : level === 'ok' ? 'line-ok' : 'line-info';
+  var line = document.createElement('div');
+  line.className = cls;
+  line.textContent = ts + ' — ' + msg;
+  el.appendChild(line);
+  el.scrollTop = el.scrollHeight;
+}
+window.toggleLog = function(){
+  var el = document.getElementById('log_output');
+  el.style.display = (el.style.display === 'none') ? 'block' : 'none';
+};
+
+// Default date input to yesterday (IST) as a sane starting point
+(function(){
+  var d = new Date();
+  d.setDate(d.getDate() - 1);
+  document.getElementById('repair_date').value = d.toISOString().split('T')[0];
+})();
+
+window.runRepair = async function(dryRun){
+  var dateStr = document.getElementById('repair_date').value;
+  var inst = document.getElementById('repair_inst').value;
+  if(!dateStr){ logLine('Pick a date first.', 'err'); return; }
+
+  document.getElementById('dryrun_btn').disabled = true;
+  document.getElementById('apply_btn').disabled = true;
+  document.getElementById('preview_wrap').innerHTML = '';
+  document.getElementById('summary_line').textContent = '';
+
+  logLine('Scanning oc_sessions for date=' + dateStr + ' inst=' + inst + '…', 'info');
+
+  try{
+    var q = query(collection(db, 'oc_sessions'), where('date', '==', dateStr));
+    var snap = await getDocs(q);
+    var docs = [];
+    snap.forEach(function(d){
+      var raw = d.data();
+      if((raw.data || {}).inst === inst) docs.push({ id: d.id, raw: raw });
+    });
+
+    if(!docs.length){
+      logLine('No documents found for that date + instrument.', 'warn');
+      document.getElementById('dryrun_btn').disabled = false;
+      return;
+    }
+
+    var pts = docs.map(function(d){
+      var dd = d.raw.data || {};
+      return {
+        _docId: d.id, time: d.raw.time, date: d.raw.date, spot: dd.spot,
+        bias: dd.overallBias || '—', rawBias: dd.overallBiasRaw || dd.overallBias || '—',
+        netPeChgRaw: dd.netPeChg || 0, netCeChgRaw: dd.netCeChg || 0,
+        candleHigh: dd.candleHigh != null ? parseFloat(dd.candleHigh) : null,
+        candleLow:  dd.candleLow  != null ? parseFloat(dd.candleLow)  : null,
+        _oldMode: dd.autoBiasMode || null, _oldType: dd.rawType || null
+      };
+    });
+    pts.sort(function(a, b){ return timeToMinutes(a.time) - timeToMinutes(b.time); });
+
+    computeAutoBiasMode(pts);
+
+    var changed = pts.filter(function(p){
+      var newMode = p.biasMode === 'raw' ? 'RAW' : p.biasMode === 'smart' ? 'SMART' : '—';
+      return newMode !== p._oldMode || (p.rawType||null) !== p._oldType;
+    });
+
+    logLine(pts.length + ' points scanned, ' + changed.length + ' would change.', changed.length ? 'warn' : 'ok');
+    document.getElementById('summary_line').textContent =
+      pts.length + ' points scanned — ' + changed.length + ' would ' + (dryRun ? 'change' : 'be patched') + '.';
+
+    renderPreview(pts, changed);
+
+    if(dryRun){
+      lastDryRunResult = { dateStr: dateStr, inst: inst, pts: pts };
+      document.getElementById('apply_btn').disabled = (changed.length === 0);
+      logLine('DRY RUN complete — nothing written. Click Apply Fix to patch these ' + changed.length + ' docs.', 'info');
+    } else {
+      // Actual write path (called from confirmApply after user confirms)
+      var done = 0, failed = 0;
+      for(var i = 0; i < pts.length; i++){
+        var p = pts[i];
+        var newMode = p.biasMode === 'raw' ? 'RAW' : p.biasMode === 'smart' ? 'SMART' : '—';
+        try{
+          await setDoc(doc(db, 'oc_sessions', p._docId), { data: {
+            autoBiasMode: newMode, rawType: p.rawType || null, followBias: p.followBias || null,
+            trailingHigh: p.trailingHigh || null, trailingLow: p.trailingLow || null
+          }}, { merge: true });
+          done++;
+        }catch(e){ failed++; logLine('Failed on ' + p._docId + ': ' + e.message, 'err'); }
+      }
+      logLine('Done — patched ' + done + ', failed ' + failed + '.', failed ? 'err' : 'ok');
+      lastDryRunResult = null;
+      document.getElementById('apply_btn').disabled = true;
+    }
+  }catch(e){
+    logLine('Error: ' + e.message, 'err');
+  }
+  document.getElementById('dryrun_btn').disabled = false;
+};
+
+window.confirmApply = function(){
+  if(!lastDryRunResult){
+    logLine('Run a dry run first for this date + instrument.', 'err');
+    return;
+  }
+  var dateStr = document.getElementById('repair_date').value;
+  var inst = document.getElementById('repair_inst').value;
+  if(dateStr !== lastDryRunResult.dateStr || inst !== lastDryRunResult.inst){
+    logLine('Date/instrument changed since dry run — please dry run again first.', 'err');
+    return;
+  }
+  var ok = confirm('This will permanently overwrite autoBiasMode/rawType/followBias/trailing fields for ' +
+    dateStr + ' (' + inst + ') in Firestore. This cannot be undone. Continue?');
+  if(!ok) return;
+  runRepair(false);
+};
+
+function renderPreview(pts, changed){
+  var wrap = document.getElementById('preview_wrap');
+  if(!changed.length){
+    wrap.innerHTML = '<div class="hint">No changes needed — this date is already correct.</div>';
+    return;
+  }
+  var rows = changed.slice(0, 100).map(function(p){
+    var newMode = p.biasMode === 'raw' ? 'RAW' : p.biasMode === 'smart' ? 'SMART' : '—';
+    var newBadge = newMode === 'RAW' ? '<span class="badge badge-raw">RAW</span>' : newMode === 'SMART' ? '<span class="badge badge-smart">SMART</span>' : '<span class="badge badge-none">—</span>';
+    var oldBadge = p._oldMode === 'RAW' ? '<span class="badge badge-raw">RAW</span>' : p._oldMode === 'SMART' ? '<span class="badge badge-smart">SMART</span>' : '<span class="badge badge-none">' + (p._oldMode || '—') + '</span>';
+    return '<tr class="changed"><td>' + p.time + '</td><td>' + oldBadge + ' / ' + (p._oldType||'—') + '</td><td>' + newBadge + ' / ' + (p.rawType||'—') + '</td></tr>';
+  }).join('');
+  wrap.innerHTML = '<table class="preview"><thead><tr><th>Time</th><th>Old (mode/type)</th><th>New (mode/type)</th></tr></thead><tbody>' + rows + '</tbody></table>' +
+    (changed.length > 100 ? '<div class="hint">Showing first 100 of ' + changed.length + ' changes.</div>' : '');
+}
+</script>
+</body>
+</html>
